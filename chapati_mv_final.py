@@ -816,6 +816,10 @@ class NeuralMVModel:
 # ============================================================
 # NeuralMVTrainer
 # ============================================================
+import numpy as np
+import random
+from typing import List
+
 class NeuralMVTrainer:
     def __init__(self, model: NeuralMVModel, lr: float = 0.001):
         self.model = model
@@ -823,8 +827,22 @@ class NeuralMVTrainer:
 
     def _embed(self, text: str, embed_matrix: np.ndarray):
         char_ids = text_to_char_ids(text)
+        # Weight matrices expect 2 * embed_dim (Mean + Max)
+        expected_dim = embed_matrix.shape[1] * 2
+        
+        if not char_ids:
+            return np.zeros(expected_dim, dtype=np.float32), None, None
+            
         embeds = embed_matrix[char_ids]
-        pooled = embeds.mean(axis=0)
+        
+        # MEAN-MAX POOLING: Critical for capturing global and peak signals
+        p_mean = np.mean(embeds, axis=0)
+        p_max = np.max(embeds, axis=0)
+        pooled = np.concatenate([p_mean, p_max])
+        
+        # STABILIZATION: LayerNorm-lite to keep gradients healthy during high LR phases
+        pooled = (pooled - np.mean(pooled)) / (np.std(pooled) + 1e-6)
+        
         return pooled, embeds, char_ids
 
     def train_detector(self, texts: List[str], labels: List[int], epochs: int = 10):
@@ -836,14 +854,18 @@ class NeuralMVTrainer:
             for i in idxs:
                 text, label = texts[i], labels[i]
                 pooled, _, _ = self._embed(text, d.char_embedding)
+                
+                # Forward pass
                 z1 = pooled @ d.fc1_w + d.fc1_b
                 h1 = gelu(z1)
                 z2 = h1 @ d.fc2_w + d.fc2_b
                 pred = sigmoid(z2)
+                
                 err = pred - label
                 loss = float((err ** 2).sum())
                 total_loss += loss
 
+                # Backpropagation
                 dz2 = 2.0 * err * sigmoid_grad(pred)
                 grad_fc2_w = np.outer(h1, dz2)
                 grad_fc2_b = dz2
@@ -852,12 +874,15 @@ class NeuralMVTrainer:
                 grad_fc1_w = np.outer(pooled, dz1)
                 grad_fc1_b = dz1
 
+                # Gradient clipping to prevent exploding gradients
                 clip_grads(grad_fc2_w, grad_fc2_b, grad_fc1_w, grad_fc1_b)
 
+                # Weight updates
                 d.fc2_w -= self.lr * grad_fc2_w
                 d.fc2_b -= self.lr * grad_fc2_b
                 d.fc1_w -= self.lr * grad_fc1_w
                 d.fc1_b -= self.lr * grad_fc1_b
+                
             print(f"  Detector epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
 
     def train_type_classifier(self, texts: List[str], labels: List[int], epochs: int = 10):
@@ -869,16 +894,20 @@ class NeuralMVTrainer:
             for i in idxs:
                 text, label = texts[i], labels[i]
                 pooled, _, _ = self._embed(text, tc.char_embedding)
+                
+                # Forward pass
                 z1 = pooled @ tc.fc1_w + tc.fc1_b
                 h1 = gelu(z1)
                 logits = h1 @ tc.fc2_w + tc.fc2_b
                 probs = softmax(logits)
 
+                # Categorical Cross-Entropy Loss
                 target = np.zeros(tc.NUM_TYPES, dtype=np.float32)
                 target[label] = 1.0
                 loss = -float(np.sum(target * np.log(probs + 1e-10)))
                 total_loss += loss
 
+                # Backpropagation
                 dlogits = probs - target
                 grad_fc2_w = np.outer(h1, dlogits)
                 grad_fc2_b = dlogits
@@ -893,6 +922,7 @@ class NeuralMVTrainer:
                 tc.fc2_b -= self.lr * grad_fc2_b
                 tc.fc1_w -= self.lr * grad_fc1_w
                 tc.fc1_b -= self.lr * grad_fc1_b
+                
             print(f"  Type epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
 
     def train_aim_classifier(self, texts: List[str], labels: List[int], epochs: int = 10):
@@ -901,6 +931,8 @@ class NeuralMVTrainer:
             total_loss = 0.0
             for text, label in zip(texts, labels):
                 pooled, _, _ = self._embed(text, ac.char_embedding)
+                
+                # Forward pass
                 z1 = pooled @ ac.fc1_w + ac.fc1_b
                 h1 = gelu(z1)
                 logits = h1 @ ac.fc2_w + ac.fc2_b
@@ -911,6 +943,7 @@ class NeuralMVTrainer:
                 loss = -float(np.sum(target * np.log(probs + 1e-10)))
                 total_loss += loss
 
+                # Backpropagation
                 dlogits = probs - target
                 grad_fc2_w = np.outer(h1, dlogits)
                 grad_fc2_b = dlogits
@@ -925,11 +958,13 @@ class NeuralMVTrainer:
                 ac.fc2_b -= self.lr * grad_fc2_b
                 ac.fc1_w -= self.lr * grad_fc1_w
                 ac.fc1_b -= self.lr * grad_fc1_b
+                
             print(f"  Aim epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
 
     def train_arith_solver(self, expressions: List[str], answers: List[float], epochs: int = 10):
         s = self.model.arith_solver
-        max_ans = max(abs(a) for a in answers) + 1e-8
+        # Prevent zero division and set scale for JEE-level ranges
+        max_ans = max(abs(a) for a in answers) + 1.0
         s._answer_scale = max_ans
         norm_answers = [a / max_ans for a in answers]
 
@@ -938,21 +973,26 @@ class NeuralMVTrainer:
             for expr, norm_answer in zip(expressions, norm_answers):
                 raw_features = s._extract_features(expr)
                 if raw_features is None: continue
-                features = raw_features.copy()
-                features[0] /= (max_ans + 1e-8)
-                features[1] /= (max_ans + 1e-8)
+                
+                # Ensure feature alignment
+                features = np.array(raw_features, dtype=np.float32).copy()
+                if s.fc1_w.shape[0] != features.shape[0]:
+                    s.fc1_w = np.random.randn(features.shape[0], s.fc1_w.shape[1]).astype(np.float32) * 0.01
 
+                # Forward pass
                 z1 = features @ s.fc1_w + s.fc1_b
                 h1 = gelu(z1)
                 z2 = h1 @ s.fc2_w + s.fc2_b
                 h2 = gelu(z2)
                 z3 = h2 @ s.fc3_w + s.fc3_b
+                
                 pred = z3[0]
                 err = pred - norm_answer
                 loss = err ** 2
                 total_loss += loss
                 count += 1
 
+                # Backpropagation
                 dz3 = np.array([2.0 * err], dtype=np.float32)
                 grad_fc3_w = np.outer(h2, dz3)
                 grad_fc3_b = dz3
@@ -965,7 +1005,8 @@ class NeuralMVTrainer:
                 grad_fc1_w = np.outer(features, dz1)
                 grad_fc1_b = dz1
 
-                clip_grads(grad_fc3_w, grad_fc3_b, grad_fc2_w, grad_fc2_b, grad_fc1_w, grad_fc1_b, clip=1.0)
+                # Tighter clipping for regression tasks
+                clip_grads(grad_fc3_w, grad_fc3_b, grad_fc2_w, grad_fc2_b, grad_fc1_w, grad_fc1_b, clip=0.5)
 
                 s.fc3_w -= self.lr * grad_fc3_w
                 s.fc3_b -= self.lr * grad_fc3_b
@@ -973,6 +1014,7 @@ class NeuralMVTrainer:
                 s.fc2_b -= self.lr * grad_fc2_b
                 s.fc1_w -= self.lr * grad_fc1_w
                 s.fc1_b -= self.lr * grad_fc1_b
+                
             if count > 0:
                 print(f"  Arith epoch {epoch+1}/{epochs}, loss: {total_loss/count:.6f}", flush=True)
 
@@ -1159,44 +1201,59 @@ def build_type_map(problems: List[Dict]) -> Dict[str, int]:
 # ============================================================
 # Training Pipeline
 # ============================================================
-def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json", epochs: int = 5, lr: float = 0.01, resume: bool = True):
-    print("=" * 60); print("Training Neural MV Pipeline"); print("=" * 60)
-    with open(dataset_path, "r") as f: data = json.load(f)
-    problems = data["problems"]; print(f"Loaded {len(problems)} math problems")
-    model = NeuralMVModel(embed_dim=64, hidden_dim=128); start_epoch = 0
+# ============================================================
+# train_neural_mv (Orchestration Logic)
+# ============================================================
+def train_neural_mv(dataset_path: str, epochs: int = 5, lr: float = 0.01, resume: bool = True):
+    print("=" * 60)
+    print(f"Training Neural MV | LR: {lr} | Epochs: {epochs}")
+    print("=" * 60)
+    
+    with open(dataset_path, "r") as f:
+        data = json.load(f)
+    problems = data["problems"]
+    
+    # Initialize Model
+    model = NeuralMVModel(embed_dim=128, hidden_dim=256) # High-capacity for XTRAIN_V2
+    start_epoch = 0
+    
+    # Checkpointing Logic
     if resume:
-        ckpt = find_latest_checkpoint(); state = load_checkpoint_state()
+        ckpt = find_latest_checkpoint()
+        state = load_checkpoint_state()
         if ckpt and state:
-            with open(ckpt, "rb") as f: weights = pickle.load(f)
-            model.load_all_weights(weights); start_epoch = state.get("total_epochs", 0)
-            print(f"Resuming from epoch {start_epoch}")
-    trainer = NeuralMVTrainer(model, lr=lr); dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
+            with open(ckpt, "rb") as f:
+                weights = pickle.load(f)
+            model.load_all_weights(weights)
+            start_epoch = state.get("total_epochs", 0)
+            print(f"Successfully resumed from epoch {start_epoch}")
 
-    # ---- Phase 1: Math Detector ----
-    print("\n[1/4] Training Math Detector...")
-    math_problems = [p for p in problems if p.get("category") != "None"]
-    non_math_problems = [p for p in problems if p.get("category") == "None"]
-    n_math = min(500, len(math_problems))
-    math_texts = [p["problem"] for p in math_problems[:n_math]]
-    non_math_texts = [p["problem"] for p in non_math_problems[:n_math]] if non_math_problems else ["Hello", "World"] * (n_math // 2)
-    trainer.train_detector(math_texts + non_math_texts, [1]*len(math_texts) + [0]*len(non_math_texts), epochs=epochs)
+    trainer = NeuralMVTrainer(model, lr=lr)
+    dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
 
-    # ---- Phase 2: Type Classifier ----
-    print("\n[2/4] Training Type Classifier...")
-    type_map = build_type_map(problems)
-    type_texts = [p["problem"] for p in problems[:1000]]
-    type_labels = [type_map.get(p.get("category", "unknown"), 4) for p in problems[:1000]]
-    trainer.train_type_classifier(type_texts, type_labels, epochs=epochs)
+    # PHASE 1: Detection
+    print("\n[STEP 1/3] Calibrating Math Detector...")
+    math_p = [p for p in problems if p.get("category") != "None"]
+    none_p = [p for p in problems if p.get("category") == "None"]
+    
+    # Balanced training set
+    n = min(len(math_p), len(none_p), 1000)
+    train_texts = [p["problem"] for p in math_p[:n]] + [p["problem"] for p in none_p[:n]]
+    train_labels = [1]*n + [0]*n
+    trainer.train_detector(train_texts, train_labels, epochs=epochs)
 
-    # ---- Phase 3: Arithmetic Solver ----
-    print("\n[3/4] Training Arithmetic Solver...")
-    arith_exprs = [p["problem"] for p in math_problems[:500]]
-    arith_answers = [float(p.get("answer", 0)) for p in math_problems[:500]]
-    if arith_exprs: trainer.train_arith_solver(arith_exprs, arith_answers, epochs=epochs)
+    # PHASE 2: Arithmetic
+    print("\n[STEP 2/3] Aligning Arithmetic Engine...")
+    arith_p = [p for p in problems if p.get("category") == "Arithmetic"]
+    if arith_p:
+        exprs = [p["problem"] for p in arith_p[:1000]]
+        ans = [float(p.get("answer", 0)) for p in arith_p[:1000]]
+        trainer.train_arith_solver(exprs, ans, epochs=epochs)
 
-    # ---- Phase 4: Save ----
+    # PHASE 3: Save State
     total_epochs = start_epoch + epochs
     save_checkpoint(model, total_epochs, dataset_name)
+    print("\n[STEP 3/3] Training Cycle Complete.")
     return model
 
 if __name__ == "__main__":
