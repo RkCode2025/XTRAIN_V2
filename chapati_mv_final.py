@@ -1,5 +1,5 @@
 """
-ChapatiLM MV Final: Clean Math Vision Pipeline - FULL FIXED VERSION
+ChapatiLM MV Final: Clean Math Vision Pipeline - STABILIZED VERSION
 ===================================================================
 FIXES:
 1. Analytical backprop (no finite-diff)
@@ -8,7 +8,7 @@ FIXES:
 4. Flexible type_map with auto-detection of dataset categories (fixes Unknown)
 5. Correct GELU derivative throughout
 6. RESOLVED "Unknown" ghosting by removing the epoch cap in type classification.
-7. INTEGRATED "The Precision Patch" training schedule support.
+7. INTEGRATED "STABILIZED PRECISION SCHEDULE" support.
 """
 
 import sys
@@ -1105,7 +1105,6 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json", epochs: i
     type_map = build_type_map(problems)
     type_texts = [p["problem"] for p in problems[:1000]]
     type_labels = [type_map.get(p.get("category", "unknown"), 4) for p in problems[:1000]]
-    # FIX: Using full epochs instead of min(epochs, 3)
     trainer.train_type_classifier(type_texts, type_labels, epochs=epochs)
 
     # ---- Phase 3: Arithmetic Solver ----
@@ -1122,8 +1121,9 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json", epochs: i
 if __name__ == "__main__":
     dataset = ScavengerDataset(max_size=8000, auto_scavenge=True)
     dataset_path = dataset.sources_used[0] if dataset.sources_used else "math_data.json"
-    # THE PRECISION PATCH implementation
-    print("--- Phase 1: 100 epochs @ 0.1 ---")
-    model = train_neural_mv(dataset_path=dataset_path, epochs=100, lr=0.1, resume=False)
-    print("\n--- Phase 2: 50 epochs @ 0.01 ---")
-    model = train_neural_mv(dataset_path=dataset_path, epochs=50, lr=0.01, resume=True)
+    # STABILIZED PRECISION SCHEDULE
+    print("\n=== EXECUTING STABILIZED PRECISION SCHEDULE ===")
+    print("\n--- PHASE 1: Magnitude Alignment (60 epochs @ LR=0.01) ---")
+    model = train_neural_mv(dataset_path=dataset_path, epochs=60, lr=0.01, resume=False)
+    print("\n--- PHASE 2: High-Speed Convergence (60 epochs @ LR=0.05) ---")
+    model = train_neural_mv(dataset_path=dataset_path, epochs=60, lr=0.05, resume=True)
