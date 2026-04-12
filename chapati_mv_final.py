@@ -270,44 +270,36 @@ def clip_grads(*grads, clip: float = 1.0):
         np.clip(g, -clip, clip, out=g)
 
 
-# ============================================================
+# ============================================================#
 # NeuralMathDetector
 # ============================================================
+
 class NeuralMathDetector:
     def __init__(self, embed_dim: int = 128):
         self.embed_dim = embed_dim
-        # 1. HE INITIALIZATION: Prevents the "0.25 Loss Plateau" by stabilizing starting variance
+        # He Init with a small gain to keep signals alive
         self.char_embedding = (np.random.randn(CHAR_VOCAB_SIZE, embed_dim) * np.sqrt(2.0 / embed_dim)).astype(np.float32)
-        
-        # 2. PARAMETER BOOST: Input is (embed_dim * 2) because we concatenate Mean and Max pooling
-        # Increased hidden layer to 64 for higher logic capacity
         self.fc1_w = (np.random.randn(embed_dim * 2, 64) * np.sqrt(2.0 / (embed_dim * 2))).astype(np.float32)
         self.fc1_b = np.zeros(64, dtype=np.float32)
-        
         self.fc2_w = (np.random.randn(64, 1) * np.sqrt(2.0 / 64)).astype(np.float32)
         self.fc2_b = np.zeros(1, dtype=np.float32)
 
     def forward(self, text: str) -> float:
-        # Pre-processing
         char_ids = text_to_char_ids(text)
-        if len(char_ids) == 0: return 0.0
-        
-        # Embedding Look-up
+        if not char_ids: return 0.0
         embeds = self.char_embedding[char_ids]
         
-        # 3. ARCHITECTURE FIX: MEAN-MAX POOLING
-        # np.mean captures the general "texture" (is it English text?)
-        # np.max captures the "spikes" (is there a digit or math operator?)
+        # MEAN-MAX POOLING: The critical bridge
         p_mean = np.mean(embeds, axis=0)
         p_max = np.max(embeds, axis=0)
         pooled = np.concatenate([p_mean, p_max]) 
         
-        # Inference layers
+        # Add a LayerNorm-lite step to prevent confidence collapse
+        pooled = (pooled - np.mean(pooled)) / (np.std(pooled) + 1e-6)
+        
         z1 = cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b
         h1 = gelu(z1)
         z2 = cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b
-        
-        # 4. NUMERICAL GUARD: Stable Sigmoid
         return float(1.0 / (1.0 + np.exp(-np.clip(z2[0], -15, 15))))
 
     def is_math_query(self, text: str, threshold: float = 0.5) -> bool:
@@ -1065,8 +1057,44 @@ class ScavengerDataset:
         for p in data.get("problems", [])[:self.max_size]: self.samples.append(f"<math>{p['problem']}</math>"); self.quality_scores.append(0.95)
 
     def _generate_synthetic(self):
-        # Placeholder for actual generation logic
-        for _ in range(self.max_size): self.samples.append("<math>1+1</math>"); self.quality_scores.append(0.95)
+        """Generates a high-contrast synthetic dataset with natural language templates."""
+        print(f"  Generating {self.max_size} high-contrast synthetic samples...")
+        
+        templates = [
+            "{a} + {b}",
+            "What is {a} plus {b}?",
+            "calculate {a} + {b}",
+            "solve {a} + {b} = ?",
+            "add {a} and {b}",
+            "Find the sum of {a} and {b}"
+        ]
+        
+        synthetic_data = []
+        for _ in range(self.max_size):
+            a = random.randint(1, 100)
+            b = random.randint(1, 100)
+            
+            # Select a random template to wrap the math problem
+            template = random.choice(templates)
+            problem_text = template.format(a=a, b=b)
+            
+            # Formulate the sample in the format the rest of your pipeline expects
+            # We store the raw problem for the classifier and solver
+            self.samples.append(f"<math>{problem_text}</math>")
+            self.quality_scores.append(0.95)
+            
+            # To ensure math_data.json is updated for the Trainer:
+            synthetic_data.append({
+                "problem": problem_text,
+                "answer": str(a + b),
+                "category": "Arithmetic"
+            })
+            
+        # Save to disk so the Trainer can pick it up in Phase 2 and 3
+        with open("math_data.json", "w") as f:
+            json.dump({"problems": synthetic_data}, f, indent=2)
+        
+        self.sources_used.append("math_data.json")
 
     def get_sample_count(self) -> int: return len(self.samples)
     def get_samples(self) -> List[str]: return self.samples
