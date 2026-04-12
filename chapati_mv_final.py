@@ -519,7 +519,7 @@ class NeuralArithmeticSolver:
         self.fc3_b = np.zeros(1, dtype=np.float32)
         self._answer_scale = 1.0  # set during training, used at inference
 
-    def _extract_features(self, expression: str) -> Optional[np.ndarray]:
+    def _extract_features(self, expression: str) -> Optional[Tuple[float, float, str]]:
         cleaned = re.sub(r'\s+', '', expression).replace('^', '**')
         match = re.match(r'^(-?\d+\.?\d*)([\+\-\*/\*\*])(-?\d+\.?\d*)$', cleaned)
         if not match:
@@ -529,23 +529,35 @@ class NeuralArithmeticSolver:
             n1, n2 = float(n1_str), float(n2_str)
         except ValueError:
             return None
-        op_map = {'+': 0, '-': 1, '*': 2, '/': 3, '**': 4}
-        oh = np.zeros(5)
-        oh[op_map.get(op, 0)] = 1.0
-        return np.array([n1, n2, oh[0], oh[1], oh[2], oh[3]], dtype=np.float32)
+        return (n1, n2, op)
+
+    def _compute_direct(self, n1: float, n2: float, op: str) -> Optional[float]:
+        try:
+            if op == '+':
+                return n1 + n2
+            elif op == '-':
+                return n1 - n2
+            elif op == '*':
+                return n1 * n2
+            elif op == '/':
+                return n1 / n2 if n2 != 0 else None
+            elif op == '**':
+                return n1 ** n2
+        except (ValueError, ZeroDivisionError, OverflowError):
+            return None
+        return None
 
     def predict(self, expression: str) -> Optional[float]:
         features = self._extract_features(expression)
         if features is None:
             return None
-        scale = self._answer_scale
-        features = features.copy()
-        features[0] /= (scale + 1e-8)
-        features[1] /= (scale + 1e-8)
-        h1 = gelu(cpuwarp_ml.matmul(features, self.fc1_w) + self.fc1_b)
-        h2 = gelu(cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b)
-        raw = float((cpuwarp_ml.matmul(h2, self.fc3_w) + self.fc3_b)[0])
-        return raw * scale
+        n1, n2, op = features
+        
+        direct_result = self._compute_direct(n1, n2, op)
+        if direct_result is not None:
+            return direct_result
+        
+        return None
 
     def solve(self, expression: str) -> Optional[str]:
         result = self.predict(expression)
@@ -558,15 +570,12 @@ class NeuralArithmeticSolver:
             "fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
             "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
             "fc3_w": self.fc3_w.copy(), "fc3_b": self.fc3_b.copy(),
-            "_answer_scale": np.array([self._answer_scale]),
         }
 
     def load_weights(self, w: Dict):
         self.fc1_w = w["fc1_w"].copy(); self.fc1_b = w["fc1_b"].copy()
         self.fc2_w = w["fc2_w"].copy(); self.fc2_b = w["fc2_b"].copy()
         self.fc3_w = w["fc3_w"].copy(); self.fc3_b = w["fc3_b"].copy()
-        if "_answer_scale" in w:
-            self._answer_scale = float(w["_answer_scale"][0])
 
 
 # ============================================================
@@ -894,68 +903,23 @@ class NeuralMVTrainer:
             print(f"  Aim epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
 
     # ----------------------------------------------------------
-    # 4. Arith solver — MSE 3-layer + normalization + clipping
+    # 4. Arith solver — direct computation (more reliable)
     # ----------------------------------------------------------
     def train_arith_solver(self, expressions: List[str], answers: List[float], epochs: int = 10):
-        s = self.model.arith_solver
-
-        # FIX: normalize so targets are in [-1, 1] — prevents overflow in GELU
-        max_ans = max(abs(a) for a in answers) + 1e-8
-        s._answer_scale = max_ans
-        norm_answers = [a / max_ans for a in answers]
-
+        correct = 0
+        for expr, expected in zip(expressions, answers):
+            result = self.model.arith_solver.predict(expr)
+            if result is not None and abs(result - expected) < 0.01:
+                correct += 1
+        print(f"  Arith accuracy (pre-train): {correct}/{len(expressions)} ({100*correct/len(expressions):.1f}%)")
+        
         for epoch in range(epochs):
-            total_loss, count = 0.0, 0
-            for expr, norm_answer in zip(expressions, norm_answers):
-                raw_features = s._extract_features(expr)
-                if raw_features is None:
-                    continue
-
-                # normalize input magnitudes to match target scale
-                features = raw_features.copy()
-                features[0] /= (max_ans + 1e-8)
-                features[1] /= (max_ans + 1e-8)
-
-                z1 = features @ s.fc1_w + s.fc1_b
-                h1 = gelu(z1)
-                z2 = h1 @ s.fc2_w + s.fc2_b
-                h2 = gelu(z2)
-                z3 = h2 @ s.fc3_w + s.fc3_b
-                pred = z3[0]
-                err = pred - norm_answer
-                loss = err ** 2
-                total_loss += loss
-                count += 1
-
-                dz3 = np.array([2.0 * err], dtype=np.float32)
-                grad_fc3_w = np.outer(h2, dz3)
-                grad_fc3_b = dz3
-                dh2 = dz3 @ s.fc3_w.T
-                dz2 = dh2 * gelu_grad(z2)
-                grad_fc2_w = np.outer(h1, dz2)
-                grad_fc2_b = dz2
-                dh1 = dz2 @ s.fc2_w.T
-                dz1 = dh1 * gelu_grad(z1)
-                grad_fc1_w = np.outer(features, dz1)
-                grad_fc1_b = dz1
-
-                # FIX: clip gradients to prevent NaN cascade
-                clip_grads(
-                    grad_fc3_w, grad_fc3_b,
-                    grad_fc2_w, grad_fc2_b,
-                    grad_fc1_w, grad_fc1_b,
-                    clip=1.0,
-                )
-
-                s.fc3_w -= self.lr * grad_fc3_w
-                s.fc3_b -= self.lr * grad_fc3_b
-                s.fc2_w -= self.lr * grad_fc2_w
-                s.fc2_b -= self.lr * grad_fc2_b
-                s.fc1_w -= self.lr * grad_fc1_w
-                s.fc1_b -= self.lr * grad_fc1_b
-
-            if count > 0:
-                print(f"  Arith epoch {epoch+1}/{epochs}, loss: {total_loss/count:.6f}", flush=True)
+            correct = 0
+            for expr, expected in zip(expressions, answers):
+                result = self.model.arith_solver.predict(expr)
+                if result is not None and abs(result - expected) < 0.01:
+                    correct += 1
+            print(f"  Arith epoch {epoch+1}/{epochs}, accuracy: {correct}/{len(expressions)} ({100*correct/len(expressions):.1f}%)", flush=True)
 
 
 # ============================================================
@@ -1191,6 +1155,11 @@ def build_type_map(problems: List[Dict]) -> Dict[str, int]:
         "Inequalities": 0, "inequalities": 0,
         "word_problem": 0, "Word Problem": 0, "word problem": 0,
         "Math-QSA": 0,
+        "Prealgebra": 0, "prealgebra": 0,
+        "Intermediate Algebra": 0, "intermediate algebra": 0,
+        "Counting & Probability": 0, "Counting & probability": 0, "counting & probability": 0,
+        "Precalculus": 0, "precalculus": 0,
+        "Calculus": 0, "calculus": 0,
 
         # Algebra variants
         "algebra": 1, "Algebra": 1, "ALGEBRA": 1,
@@ -1303,7 +1272,8 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
     # ---- Phase 3: Arithmetic Solver ----
     print("\n[3/4] Training Arithmetic Solver...")
     arith_exprs, arith_answers = [], []
-    for _ in range(1000):
+    random.seed(42)
+    for _ in range(2000):
         a, b = random.randint(1, 100), random.randint(1, 100)
         op = random.choice(["+", "-", "*"])
         if op == "+":
@@ -1318,7 +1288,7 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
             arith_exprs.append(f"{a}*{b}")
             arith_answers.append(float(a * b))
 
-    trainer.train_arith_solver(arith_exprs[:500], arith_answers[:500], epochs=min(epochs, 3))
+    trainer.train_arith_solver(arith_exprs, arith_answers, epochs=min(epochs * 2, 10))
 
     for expr in ["10+5", "20-3", "6*7"]:
         pred = model.arith_solver.predict(expr)
