@@ -1,12 +1,11 @@
 """
 ChapatiLM MV Final: Clean Math Vision Pipeline
 ===============================================
-ONLY components:
-- TekkenTokenizer (BPE + R2L digit tokenization)
-- Neural MV Components (all learnable, checkpointable)
-- Neural Orchestration System (reasoning/scoring)
-- ScavengerDataset (auto-finds 8000 math JSON)
-- Training pipeline
+FIXED: Analytical backpropagation (replaces slow numerical finite-difference gradients)
+- train_detector: MSE + sigmoid output + analytical grads
+- train_type_classifier: cross-entropy + softmax + analytical grads
+- train_arith_solver: MSE + 3-layer analytical grads
+- Correct GELU derivative used throughout
 """
 
 import sys
@@ -22,7 +21,6 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 
 import cpuwarp_ml
-import re
 
 
 # ============================================================
@@ -51,19 +49,30 @@ class TekkenTokenizer:
         vocab = dict(self.special_tokens)
         for i in range(32, 127):
             vocab[chr(i)] = len(vocab)
-        extended = ["\u20ac","\u00a3","\u00a5","\u00a9","\u00ae","\u2122","\u00b0","\u00b1","\u00b5","\u00b7","\u00a7","\u00b6","\u2020","\u2021","\u2022","\u2026","\u2013","\u2014","\u2764","\ud83d\udd25","\ud83d\ude80","\ud83d\udca1","\ud83d\udcca","\ud83d\udd27","\ud83d\udcbb","\ud83d\udcf1","\ud83c\udf0d","\ud83d\udd12","\ud83d\udd11","\ud83d\udcc8","\ud83d\udcc9","\ud83d\udcb0"]
+        extended = ["\u20ac","\u00a3","\u00a5","\u00a9","\u00ae","\u2122","\u00b0","\u00b1",
+                    "\u00b5","\u00b7","\u00a7","\u00b6","\u2020","\u2021","\u2022","\u2026",
+                    "\u2013","\u2014","\u2764","\ud83d\udd25","\ud83d\ude80","\ud83d\udca1",
+                    "\ud83d\udcca","\ud83d\udd27","\ud83d\udcbb","\ud83d\udcf1","\ud83c\udf0d",
+                    "\ud83d\udd12","\ud83d\udd11","\ud83d\udcc8","\ud83d\udcc9","\ud83d\udcb0"]
         for c in extended:
             if c not in vocab:
                 vocab[c] = len(vocab)
-        common_words = ["the","be","to","of","and","a","in","that","have","I","it","for","not","on","with","he","as","you","do","at","this","but","his","by","from","they","we","say","her","she","or","an","will","my","one","all","would","there","their","what"]
+        common_words = ["the","be","to","of","and","a","in","that","have","I","it","for","not",
+                        "on","with","he","as","you","do","at","this","but","his","by","from",
+                        "they","we","say","her","she","or","an","will","my","one","all","would",
+                        "there","their","what"]
         for w in common_words:
             if w not in vocab:
                 vocab[w] = len(vocab)
-        subwords = ["ing","ed","s","es","ly","tion","ment","ness","ful","less","un","re","pre","dis","able","ible","al","ive","ize","ate","ify","hood","ship","dom"]
+        subwords = ["ing","ed","s","es","ly","tion","ment","ness","ful","less","un","re","pre",
+                    "dis","able","ible","al","ive","ize","ate","ify","hood","ship","dom"]
         for sw in subwords:
             if sw not in vocab:
                 vocab[sw] = len(vocab)
-        byte_pairs = ["th","he","in","er","an","re","on","at","en","nd","ti","es","or","te","of","ed","is","it","al","ar","st","to","ha","ng","se","ou","io","le","ve","co","me","de","hi","ri","ro","ic","ne","ea","ra","ce","li","ch","ll","be","ma","si","om","ur","ad","id"]
+        byte_pairs = ["th","he","in","er","an","re","on","at","en","nd","ti","es","or","te","of",
+                      "ed","is","it","al","ar","st","to","ha","ng","se","ou","io","le","ve","co",
+                      "me","de","hi","ri","ro","ic","ne","ea","ra","ce","li","ch","ll","be","ma",
+                      "si","om","ur","ad","id"]
         for bp in byte_pairs:
             if bp not in vocab:
                 vocab[bp] = len(vocab)
@@ -191,7 +200,7 @@ class TekkenTokenizer:
 
 
 # ============================================================
-# Neural MV Components (all learnable, checkpointable)
+# Neural MV Components
 # ============================================================
 CHAR_VOCAB = "abcdefghijklmnopqrstuvwxyz0123456789 +-*/=().%^<>,!?&|~@#$:;\"'\\/\n\t"
 CHAR_TO_IDX = {c: i for i, c in enumerate(CHAR_VOCAB)}
@@ -216,11 +225,32 @@ def gelu(x: np.ndarray) -> np.ndarray:
     return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
 
 
+def gelu_grad(x: np.ndarray) -> np.ndarray:
+    """Correct analytical derivative of GELU."""
+    k = 0.7978845608  # sqrt(2/pi)
+    tanh_arg = k * (x + 0.044715 * x**3)
+    tanh_val = np.tanh(tanh_arg)
+    sech2 = 1.0 - tanh_val**2
+    return 0.5 * (1.0 + tanh_val) + 0.5 * x * sech2 * k * (1.0 + 3.0 * 0.044715 * x**2)
+
+
 def sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
 
 
-# --- 1. NeuralMathDetector ---
+def sigmoid_grad(s: np.ndarray) -> np.ndarray:
+    """Derivative of sigmoid given sigmoid output s."""
+    return s * (1.0 - s)
+
+
+def softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - np.max(x))
+    return e / (e.sum() + 1e-10)
+
+
+# ============================================================
+# NeuralMathDetector
+# ============================================================
 class NeuralMathDetector:
     def __init__(self, embed_dim: int = 64):
         self.embed_dim = embed_dim
@@ -234,15 +264,20 @@ class NeuralMathDetector:
         char_ids = text_to_char_ids(text)
         embeds = char_ids_to_embedding(char_ids, self.char_embedding)
         pooled = embeds.mean(axis=0)
-        h = gelu(cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b)
-        return float(cpuwarp_ml.softmax(cpuwarp_ml.matmul(h, self.fc2_w) + self.fc2_b)[0])
+        z1 = cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b
+        h1 = gelu(z1)
+        z2 = cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b
+        return float(sigmoid(z2)[0])
 
     def is_math_query(self, text: str, threshold: float = 0.5) -> bool:
         return self.forward(text) >= threshold
 
     def get_weights(self) -> Dict:
-        return {"char_embedding": self.char_embedding.copy(), "fc1_w": self.fc1_w.copy(),
-                "fc1_b": self.fc1_b.copy(), "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy()}
+        return {
+            "char_embedding": self.char_embedding.copy(),
+            "fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
+            "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
         self.char_embedding = w["char_embedding"].copy()
@@ -252,7 +287,9 @@ class NeuralMathDetector:
         self.fc2_b = w["fc2_b"].copy()
 
 
-# --- 2. NeuralTypeClassifier ---
+# ============================================================
+# NeuralTypeClassifier
+# ============================================================
 class NeuralTypeClassifier:
     TYPE_NAMES = ["Arithmetic", "Algebraic", "Comparison", "Geometric", "Unknown"]
     NUM_TYPES = 5
@@ -268,19 +305,24 @@ class NeuralTypeClassifier:
         char_ids = text_to_char_ids(text)
         embeds = char_ids_to_embedding(char_ids, self.char_embedding)
         pooled = embeds.mean(axis=0)
-        h = gelu(cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b)
-        logits = cpuwarp_ml.matmul(h, self.fc2_w) + self.fc2_b
-        return cpuwarp_ml.softmax(logits)
+        z1 = cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b
+        h1 = gelu(z1)
+        logits = cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b
+        return softmax(logits)
 
     def classify(self, text: str) -> str:
         return self.TYPE_NAMES[int(np.argmax(self.forward(text)))]
 
     def get_probs(self, text: str) -> Dict[str, float]:
-        return {n: float(self.forward(text)[i]) for i, n in enumerate(self.TYPE_NAMES)}
+        probs = self.forward(text)
+        return {n: float(probs[i]) for i, n in enumerate(self.TYPE_NAMES)}
 
     def get_weights(self) -> Dict:
-        return {"char_embedding": self.char_embedding.copy(), "fc1_w": self.fc1_w.copy(),
-                "fc1_b": self.fc1_b.copy(), "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy()}
+        return {
+            "char_embedding": self.char_embedding.copy(),
+            "fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
+            "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
         self.char_embedding = w["char_embedding"].copy()
@@ -290,7 +332,9 @@ class NeuralTypeClassifier:
         self.fc2_b = w["fc2_b"].copy()
 
 
-# --- 3. NeuralAimClassifier ---
+# ============================================================
+# NeuralAimClassifier
+# ============================================================
 class NeuralAimClassifier:
     AIM_NAMES = ["Calculate", "Simplify", "Solve", "Compare", "Evaluate", "Unknown"]
     NUM_AIMS = 6
@@ -306,19 +350,24 @@ class NeuralAimClassifier:
         char_ids = text_to_char_ids(text)
         embeds = char_ids_to_embedding(char_ids, self.char_embedding)
         pooled = embeds.mean(axis=0)
-        h = gelu(cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b)
-        logits = cpuwarp_ml.matmul(h, self.fc2_w) + self.fc2_b
-        return cpuwarp_ml.softmax(logits)
+        z1 = cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b
+        h1 = gelu(z1)
+        logits = cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b
+        return softmax(logits)
 
     def identify(self, text: str) -> str:
         return self.AIM_NAMES[int(np.argmax(self.forward(text)))]
 
     def get_probs(self, text: str) -> Dict[str, float]:
-        return {n: float(self.forward(text)[i]) for i, n in enumerate(self.AIM_NAMES)}
+        probs = self.forward(text)
+        return {n: float(probs[i]) for i, n in enumerate(self.AIM_NAMES)}
 
     def get_weights(self) -> Dict:
-        return {"char_embedding": self.char_embedding.copy(), "fc1_w": self.fc1_w.copy(),
-                "fc1_b": self.fc1_b.copy(), "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy()}
+        return {
+            "char_embedding": self.char_embedding.copy(),
+            "fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
+            "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
         self.char_embedding = w["char_embedding"].copy()
@@ -328,7 +377,9 @@ class NeuralAimClassifier:
         self.fc2_b = w["fc2_b"].copy()
 
 
-# --- 4. NeuralSymbolicRouter ---
+# ============================================================
+# NeuralSymbolicRouter
+# ============================================================
 class NeuralSymbolicRouter:
     ENGINE_NAMES = ["Native_Compute_Engine", "SymPy_Engine"]
 
@@ -342,15 +393,16 @@ class NeuralSymbolicRouter:
         x = np.concatenate([type_probs, aim_probs])
         h = gelu(cpuwarp_ml.matmul(x, self.fc_w) + self.fc_b)
         logits = cpuwarp_ml.matmul(h, self.out_w) + self.out_b
-        e = np.exp(logits - np.max(logits))
-        return e / (e.sum() + 1e-10)
+        return softmax(logits)
 
     def route(self, type_probs: np.ndarray, aim_probs: np.ndarray) -> str:
         return self.ENGINE_NAMES[int(np.argmax(self.forward(type_probs, aim_probs)))]
 
     def get_weights(self) -> Dict:
-        return {"fc_w": self.fc_w.copy(), "fc_b": self.fc_b.copy(),
-                "out_w": self.out_w.copy(), "out_b": self.out_b.copy()}
+        return {
+            "fc_w": self.fc_w.copy(), "fc_b": self.fc_b.copy(),
+            "out_w": self.out_w.copy(), "out_b": self.out_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
         self.fc_w = w["fc_w"].copy()
@@ -359,7 +411,9 @@ class NeuralSymbolicRouter:
         self.out_b = w["out_b"].copy()
 
 
-# --- 5. NeuralMathFilter ---
+# ============================================================
+# NeuralMathFilter
+# ============================================================
 class NeuralMathFilter:
     def __init__(self, embed_dim: int = 32):
         self.char_embedding = np.random.randn(CHAR_VOCAB_SIZE, embed_dim).astype(np.float32) * 0.02
@@ -368,20 +422,19 @@ class NeuralMathFilter:
 
     def filter(self, text: str, threshold: float = 0.5) -> str:
         text = text.lower()
-        result = []
-        for c in text:
-            if c in CHAR_TO_IDX:
-                emb = self.char_embedding[CHAR_TO_IDX[c]]
-                score = float(cpuwarp_ml.softmax(cpuwarp_ml.matmul(emb, self.fc_w) + self.fc_b)[0])
-                if score >= threshold or c == ' ':
-                    result.append(c)
-            elif c == ' ':
-                result.append(c)
+        # Vectorized: score all chars at once instead of looping with a forward pass per char
+        char_ids = np.array([CHAR_TO_IDX.get(c, 0) for c in text], dtype=np.int32)
+        embeds = self.char_embedding[char_ids]          # (T, embed_dim)
+        scores = sigmoid(embeds @ self.fc_w + self.fc_b).squeeze(-1)  # (T,)
+        result = [c for c, score in zip(text, scores)
+                  if c == ' ' or score >= threshold]
         return re.sub(r'\s+', ' ', ''.join(result)).strip()
 
     def get_weights(self) -> Dict:
-        return {"char_embedding": self.char_embedding.copy(),
-                "fc_w": self.fc_w.copy(), "fc_b": self.fc_b.copy()}
+        return {
+            "char_embedding": self.char_embedding.copy(),
+            "fc_w": self.fc_w.copy(), "fc_b": self.fc_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
         self.char_embedding = w["char_embedding"].copy()
@@ -389,19 +442,20 @@ class NeuralMathFilter:
         self.fc_b = w["fc_b"].copy()
 
 
-# --- 6. NeuralOperatorMapper ---
+# ============================================================
+# NeuralOperatorMapper
+# ============================================================
 class NeuralOperatorMapper:
     OPERATORS = ["+", "-", "*", "/", "=", "^", "%", ">", "<", "**"]
     KNOWN_WORDS = ["plus","add","sum","added","minus","subtract","difference","less","spends",
-                    "times","multiply","product","multiplied","divided","divide","quotient","over",
-                    "power","raised","squared","cubed","mod","modulo","remainder",
-                    "equals","equal","is","gives","greater","gt","lt"]
+                   "times","multiply","product","multiplied","divided","divide","quotient","over",
+                   "power","raised","squared","cubed","mod","modulo","remainder",
+                   "equals","equal","is","gives","greater","gt","lt"]
 
     def __init__(self, embed_dim: int = 32):
         self.embed_dim = embed_dim
-        self.word_embeddings = {}
-        for w in self.KNOWN_WORDS:
-            self.word_embeddings[w] = np.random.randn(embed_dim).astype(np.float32) * 0.1
+        self.word_embeddings = {w: np.random.randn(embed_dim).astype(np.float32) * 0.1
+                                for w in self.KNOWN_WORDS}
         self.op_embeddings = np.random.randn(len(self.OPERATORS), embed_dim).astype(np.float32) * 0.1
         self.proj_w = np.random.randn(embed_dim, embed_dim).astype(np.float32) * 0.1
         self.proj_b = np.zeros(embed_dim, dtype=np.float32)
@@ -424,17 +478,14 @@ class NeuralOperatorMapper:
 
     def apply_to_text(self, text: str) -> str:
         words = re.findall(r'[a-zA-Z]+|[^\s]+', text.lower())
-        result = []
-        for w in words:
-            if re.match(r'^[a-z]+$', w):
-                result.append(self.map_word(w))
-            else:
-                result.append(w)
+        result = [self.map_word(w) if re.match(r'^[a-z]+$', w) else w for w in words]
         return re.sub(r'\s+', ' ', ' '.join(result)).strip()
 
     def get_weights(self) -> Dict:
-        return {"op_embeddings": self.op_embeddings.copy(),
-                "proj_w": self.proj_w.copy(), "proj_b": self.proj_b.copy()}
+        return {
+            "op_embeddings": self.op_embeddings.copy(),
+            "proj_w": self.proj_w.copy(), "proj_b": self.proj_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
         self.op_embeddings = w["op_embeddings"].copy()
@@ -442,7 +493,9 @@ class NeuralOperatorMapper:
         self.proj_b = w["proj_b"].copy()
 
 
-# --- 7. NeuralArithmeticSolver ---
+# ============================================================
+# NeuralArithmeticSolver
+# ============================================================
 class NeuralArithmeticSolver:
     def __init__(self, hidden_dim: int = 128):
         self.fc1_w = np.random.randn(6, hidden_dim).astype(np.float32) * 0.01
@@ -463,16 +516,17 @@ class NeuralArithmeticSolver:
         except ValueError:
             return None
         op_map = {'+': 0, '-': 1, '*': 2, '/': 3, '**': 4}
-        oh = np.zeros(5); oh[op_map.get(op, 0)] = 1.0
+        oh = np.zeros(5)
+        oh[op_map.get(op, 0)] = 1.0
         return np.array([n1, n2, oh[0], oh[1], oh[2], oh[3]], dtype=np.float32)
 
     def predict(self, expression: str) -> Optional[float]:
         features = self._extract_features(expression)
         if features is None:
             return None
-        h = gelu(cpuwarp_ml.matmul(features, self.fc1_w) + self.fc1_b)
-        h = gelu(cpuwarp_ml.matmul(h, self.fc2_w) + self.fc2_b)
-        return float((cpuwarp_ml.matmul(h, self.fc3_w) + self.fc3_b)[0])
+        h1 = gelu(cpuwarp_ml.matmul(features, self.fc1_w) + self.fc1_b)
+        h2 = gelu(cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b)
+        return float((cpuwarp_ml.matmul(h2, self.fc3_w) + self.fc3_b)[0])
 
     def solve(self, expression: str) -> Optional[str]:
         result = self.predict(expression)
@@ -481,20 +535,21 @@ class NeuralArithmeticSolver:
         return str(int(result)) if result == int(result) else f"{result:.6g}"
 
     def get_weights(self) -> Dict:
-        return {"fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
-                "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
-                "fc3_w": self.fc3_w.copy(), "fc3_b": self.fc3_b.copy()}
+        return {
+            "fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
+            "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
+            "fc3_w": self.fc3_w.copy(), "fc3_b": self.fc3_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
-        self.fc1_w = w["fc1_w"].copy()
-        self.fc1_b = w["fc1_b"].copy()
-        self.fc2_w = w["fc2_w"].copy()
-        self.fc2_b = w["fc2_b"].copy()
-        self.fc3_w = w["fc3_w"].copy()
-        self.fc3_b = w["fc3_b"].copy()
+        self.fc1_w = w["fc1_w"].copy(); self.fc1_b = w["fc1_b"].copy()
+        self.fc2_w = w["fc2_w"].copy(); self.fc2_b = w["fc2_b"].copy()
+        self.fc3_w = w["fc3_w"].copy(); self.fc3_b = w["fc3_b"].copy()
 
 
-# --- 8. NeuralAlgebraicSolver ---
+# ============================================================
+# NeuralAlgebraicSolver
+# ============================================================
 class NeuralAlgebraicSolver:
     def __init__(self, hidden_dim: int = 64):
         self.fc1_w = np.random.randn(3, hidden_dim).astype(np.float32) * 0.01
@@ -505,7 +560,9 @@ class NeuralAlgebraicSolver:
         self.fc3_b = np.zeros(1, dtype=np.float32)
 
     def _parse_linear(self, expression: str) -> Optional[Tuple[float, float, float]]:
-        match = re.match(r'([\d\.\+\-\*/\*\s]*)\s*([a-zA-Z])\s*([\+\-\d\.\*/\s]*)\s*=\s*([\d\.\+\-\*/\s]*)', expression)
+        match = re.match(
+            r'([\d\.\+\-\*/\*\s]*)\s*([a-zA-Z])\s*([\+\-\d\.\*/\s]*)\s*=\s*([\d\.\+\-\*/\s]*)',
+            expression)
         if not match:
             return None
         try:
@@ -525,11 +582,10 @@ class NeuralAlgebraicSolver:
         parsed = self._parse_linear(expression)
         if parsed is None:
             return None
-        a, b, c = parsed
-        features = np.array([a, b, c], dtype=np.float32)
-        h = gelu(cpuwarp_ml.matmul(features, self.fc1_w) + self.fc1_b)
-        h = gelu(cpuwarp_ml.matmul(h, self.fc2_w) + self.fc2_b)
-        return float((cpuwarp_ml.matmul(h, self.fc3_w) + self.fc3_b)[0])
+        features = np.array(parsed, dtype=np.float32)
+        h1 = gelu(cpuwarp_ml.matmul(features, self.fc1_w) + self.fc1_b)
+        h2 = gelu(cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b)
+        return float((cpuwarp_ml.matmul(h2, self.fc3_w) + self.fc3_b)[0])
 
     def solve(self, expression: str) -> Optional[str]:
         result = self.predict(expression)
@@ -538,20 +594,21 @@ class NeuralAlgebraicSolver:
         return f"x = {int(result)}" if result == int(result) else f"x = {result:.6g}"
 
     def get_weights(self) -> Dict:
-        return {"fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
-                "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
-                "fc3_w": self.fc3_w.copy(), "fc3_b": self.fc3_b.copy()}
+        return {
+            "fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
+            "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
+            "fc3_w": self.fc3_w.copy(), "fc3_b": self.fc3_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
-        self.fc1_w = w["fc1_w"].copy()
-        self.fc1_b = w["fc1_b"].copy()
-        self.fc2_w = w["fc2_w"].copy()
-        self.fc2_b = w["fc2_b"].copy()
-        self.fc3_w = w["fc3_w"].copy()
-        self.fc3_b = w["fc3_b"].copy()
+        self.fc1_w = w["fc1_w"].copy(); self.fc1_b = w["fc1_b"].copy()
+        self.fc2_w = w["fc2_w"].copy(); self.fc2_b = w["fc2_b"].copy()
+        self.fc3_w = w["fc3_w"].copy(); self.fc3_b = w["fc3_b"].copy()
 
 
-# --- 9. NeuralComparisonSolver ---
+# ============================================================
+# NeuralComparisonSolver
+# ============================================================
 class NeuralComparisonSolver:
     def __init__(self, hidden_dim: int = 32):
         self.fc1_w = np.random.randn(2, hidden_dim).astype(np.float32) * 0.01
@@ -563,8 +620,7 @@ class NeuralComparisonSolver:
         features = np.array([a, b], dtype=np.float32)
         h = gelu(cpuwarp_ml.matmul(features, self.fc1_w) + self.fc1_b)
         logits = cpuwarp_ml.matmul(h, self.fc2_w) + self.fc2_b
-        e = np.exp(logits - np.max(logits))
-        return e / (e.sum() + 1e-10)
+        return softmax(logits)
 
     def solve(self, expression: str) -> Optional[str]:
         match = re.search(r'(\d+\.?\d*)\s*([><=!]+)\s*(\d+\.?\d*)', expression)
@@ -582,14 +638,14 @@ class NeuralComparisonSolver:
         return None
 
     def get_weights(self) -> Dict:
-        return {"fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
-                "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy()}
+        return {
+            "fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
+            "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
+        }
 
     def load_weights(self, w: Dict):
-        self.fc1_w = w["fc1_w"].copy()
-        self.fc1_b = w["fc1_b"].copy()
-        self.fc2_w = w["fc2_w"].copy()
-        self.fc2_b = w["fc2_b"].copy()
+        self.fc1_w = w["fc1_w"].copy(); self.fc1_b = w["fc1_b"].copy()
+        self.fc2_w = w["fc2_w"].copy(); self.fc2_b = w["fc2_b"].copy()
 
 
 # ============================================================
@@ -645,25 +701,28 @@ class NeuralMVModel:
         solution = {
             "query": query, "problem_type": problem_type, "aim": aim,
             "engine": engine, "result": result,
-            "tokenized": {"original": query, "cleaned": self.math_filter.filter(query),
-                          "symbolic": self.op_mapper.apply_to_text(query)},
+            "tokenized": {
+                "original": query,
+                "cleaned": self.math_filter.filter(query),
+                "symbolic": self.op_mapper.apply_to_text(query),
+            },
             "type_probs": {k: float(v) for k, v in self.type_classifier.get_probs(query).items()},
-            "aim_probs": {k: float(v) for k, v in self.aim_classifier.get_probs(query).items()},
+            "aim_probs":  {k: float(v) for k, v in self.aim_classifier.get_probs(query).items()},
         }
         self.solve_history.append(solution)
         return solution
 
     def get_all_weights(self) -> Dict:
         return {
-            "math_detector": self.detector.get_weights(),
-            "type_classifier": self.type_classifier.get_weights(),
-            "aim_classifier": self.aim_classifier.get_weights(),
-            "symbolic_router": self.symbolic_router.get_weights(),
-            "math_filter": self.math_filter.get_weights(),
-            "op_mapper": self.op_mapper.get_weights(),
-            "arith_solver": self.arith_solver.get_weights(),
-            "algebra_solver": self.algebra_solver.get_weights(),
-            "comparison_solver": self.comparison_solver.get_weights(),
+            "math_detector":    self.detector.get_weights(),
+            "type_classifier":  self.type_classifier.get_weights(),
+            "aim_classifier":   self.aim_classifier.get_weights(),
+            "symbolic_router":  self.symbolic_router.get_weights(),
+            "math_filter":      self.math_filter.get_weights(),
+            "op_mapper":        self.op_mapper.get_weights(),
+            "arith_solver":     self.arith_solver.get_weights(),
+            "algebra_solver":   self.algebra_solver.get_weights(),
+            "comparison_solver":self.comparison_solver.get_weights(),
         }
 
     def load_all_weights(self, weights: Dict):
@@ -678,96 +737,191 @@ class NeuralMVModel:
         self.comparison_solver.load_weights(weights.get("comparison_solver", {}))
 
     def count_weights(self) -> int:
-        total = 0
-        for cw in self.get_all_weights().values():
-            for arr in cw.values():
-                total += arr.size
-        return total
+        return sum(arr.size for cw in self.get_all_weights().values() for arr in cw.values())
 
 
 # ============================================================
-# NeuralMVTrainer
+# NeuralMVTrainer  —  ALL analytical backprop, zero finite-diff
 # ============================================================
 class NeuralMVTrainer:
     def __init__(self, model: NeuralMVModel, lr: float = 0.001):
         self.model = model
         self.lr = lr
 
+    # ----------------------------------------------------------
+    # Helper: embed text → pooled vector + cached intermediate
+    # ----------------------------------------------------------
+    def _embed(self, text: str, embed_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (pooled, embeds) where embeds shape is (MAX_SEQ_LEN, embed_dim)."""
+        char_ids = text_to_char_ids(text)
+        embeds = embed_matrix[char_ids]         # (T, D)
+        pooled = embeds.mean(axis=0)            # (D,)
+        return pooled, embeds, char_ids
+
+    # ----------------------------------------------------------
+    # 1. Train detector  (binary MSE + sigmoid output)
+    # ----------------------------------------------------------
     def train_detector(self, texts: List[str], labels: List[int], epochs: int = 10):
+        d = self.model.detector
         for epoch in range(epochs):
-            total_loss = 0
+            total_loss = 0.0
             for text, label in zip(texts, labels):
-                pred = self.model.detector.forward(text)
-                loss = (pred - label) ** 2
+                # ---- forward ----
+                pooled, embeds, char_ids = self._embed(text, d.char_embedding)
+                z1 = pooled @ d.fc1_w + d.fc1_b        # (32,)
+                h1 = gelu(z1)
+                z2 = h1 @ d.fc2_w + d.fc2_b            # (1,)
+                pred = sigmoid(z2)                      # (1,)
+                err = pred - label                      # scalar-ish
+                loss = float((err ** 2).sum())
                 total_loss += loss
-                eps = 1e-4
-                for attr in ["fc1_w", "fc1_b", "fc2_w", "fc2_b"]:
-                    arr = getattr(self.model.detector, attr)
-                    for idx in np.ndindex(arr.shape):
-                        orig = arr[idx]
-                        arr[idx] = orig + eps
-                        pred_plus = self.model.detector.forward(text)
-                        loss_plus = (pred_plus - label) ** 2
-                        grad = (loss_plus - loss) / eps
-                        arr[idx] = orig - self.lr * grad
-            if (epoch + 1) % 5 == 0:
-                print(f"  Detector epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}")
 
+                # ---- backward ----
+                # dL/dz2
+                dz2 = 2.0 * err * sigmoid_grad(pred)   # (1,)
+                grad_fc2_w = np.outer(h1, dz2)          # (32,1)
+                grad_fc2_b = dz2                        # (1,)
+
+                # dL/dh1 → dL/dz1
+                dh1 = dz2 @ d.fc2_w.T                  # (32,)
+                dz1 = dh1 * gelu_grad(z1)              # (32,)
+                grad_fc1_w = np.outer(pooled, dz1)      # (embed_dim, 32)
+                grad_fc1_b = dz1                        # (32,)
+
+                # ---- update ----
+                d.fc2_w -= self.lr * grad_fc2_w
+                d.fc2_b -= self.lr * grad_fc2_b
+                d.fc1_w -= self.lr * grad_fc1_w
+                d.fc1_b -= self.lr * grad_fc1_b
+
+            print(f"  Detector epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
+
+    # ----------------------------------------------------------
+    # 2. Train type classifier  (cross-entropy + softmax)
+    # ----------------------------------------------------------
     def train_type_classifier(self, texts: List[str], labels: List[int], epochs: int = 10):
+        tc = self.model.type_classifier
         for epoch in range(epochs):
-            total_loss = 0
+            total_loss = 0.0
             for text, label in zip(texts, labels):
-                probs = self.model.type_classifier.forward(text)
-                target = np.zeros(5); target[label] = 1.0
-                loss = -np.sum(target * np.log(probs + 1e-10))
-                total_loss += loss
-                eps = 1e-4
-                for attr in ["fc1_w", "fc1_b", "fc2_w", "fc2_b"]:
-                    arr = getattr(self.model.type_classifier, attr)
-                    flat = arr.flatten()
-                    for i in range(min(len(flat), 50)):
-                        idx = np.unravel_index(i, arr.shape)
-                        orig = arr[idx]
-                        arr[idx] = orig + eps
-                        probs_plus = self.model.type_classifier.forward(text)
-                        loss_plus = -np.sum(target * np.log(probs_plus + 1e-10))
-                        grad = (loss_plus - loss) / eps
-                        arr[idx] = orig - self.lr * grad
-            if (epoch + 1) % 5 == 0:
-                print(f"  Type epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}")
+                # ---- forward ----
+                pooled, embeds, char_ids = self._embed(text, tc.char_embedding)
+                z1 = pooled @ tc.fc1_w + tc.fc1_b      # (hidden,)
+                h1 = gelu(z1)
+                logits = h1 @ tc.fc2_w + tc.fc2_b      # (NUM_TYPES,)
+                probs = softmax(logits)                 # (NUM_TYPES,)
 
-    def train_arith_solver(self, expressions: List[str], answers: List[float], epochs: int = 10):
+                target = np.zeros(tc.NUM_TYPES, dtype=np.float32)
+                target[label] = 1.0
+                loss = -float(np.sum(target * np.log(probs + 1e-10)))
+                total_loss += loss
+
+                # ---- backward ----
+                # Gradient of cross-entropy + softmax combined = probs - target
+                dlogits = probs - target                # (NUM_TYPES,)
+                grad_fc2_w = np.outer(h1, dlogits)      # (hidden, NUM_TYPES)
+                grad_fc2_b = dlogits
+
+                dh1 = dlogits @ tc.fc2_w.T             # (hidden,)
+                dz1 = dh1 * gelu_grad(z1)
+                grad_fc1_w = np.outer(pooled, dz1)
+                grad_fc1_b = dz1
+
+                # ---- update ----
+                tc.fc2_w -= self.lr * grad_fc2_w
+                tc.fc2_b -= self.lr * grad_fc2_b
+                tc.fc1_w -= self.lr * grad_fc1_w
+                tc.fc1_b -= self.lr * grad_fc1_b
+
+            print(f"  Type epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
+
+    # ----------------------------------------------------------
+    # 3. Train aim classifier  (same structure as type)
+    # ----------------------------------------------------------
+    def train_aim_classifier(self, texts: List[str], labels: List[int], epochs: int = 10):
+        ac = self.model.aim_classifier
         for epoch in range(epochs):
-            total_loss = 0
-            count = 0
+            total_loss = 0.0
+            for text, label in zip(texts, labels):
+                pooled, _, _ = self._embed(text, ac.char_embedding)
+                z1 = pooled @ ac.fc1_w + ac.fc1_b
+                h1 = gelu(z1)
+                logits = h1 @ ac.fc2_w + ac.fc2_b
+                probs = softmax(logits)
+
+                target = np.zeros(ac.NUM_AIMS, dtype=np.float32)
+                target[label] = 1.0
+                loss = -float(np.sum(target * np.log(probs + 1e-10)))
+                total_loss += loss
+
+                dlogits = probs - target
+                grad_fc2_w = np.outer(h1, dlogits)
+                grad_fc2_b = dlogits
+                dh1 = dlogits @ ac.fc2_w.T
+                dz1 = dh1 * gelu_grad(z1)
+                grad_fc1_w = np.outer(pooled, dz1)
+                grad_fc1_b = dz1
+
+                ac.fc2_w -= self.lr * grad_fc2_w
+                ac.fc2_b -= self.lr * grad_fc2_b
+                ac.fc1_w -= self.lr * grad_fc1_w
+                ac.fc1_b -= self.lr * grad_fc1_b
+
+            print(f"  Aim epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
+
+    # ----------------------------------------------------------
+    # 4. Train arithmetic solver  (MSE, 3-layer)
+    # ----------------------------------------------------------
+    def train_arith_solver(self, expressions: List[str], answers: List[float], epochs: int = 10):
+        s = self.model.arith_solver
+        for epoch in range(epochs):
+            total_loss, count = 0.0, 0
             for expr, answer in zip(expressions, answers):
-                pred = self.model.arith_solver.predict(expr)
-                if pred is None:
+                features = s._extract_features(expr)
+                if features is None:
                     continue
-                loss = (pred - answer) ** 2
+
+                # ---- forward ----
+                z1 = features @ s.fc1_w + s.fc1_b      # (hidden,)
+                h1 = gelu(z1)
+                z2 = h1 @ s.fc2_w + s.fc2_b            # (64,)
+                h2 = gelu(z2)
+                z3 = h2 @ s.fc3_w + s.fc3_b            # (1,)
+                pred = z3[0]
+                err = pred - answer
+                loss = err ** 2
                 total_loss += loss
                 count += 1
-                eps = 1e-4
-                for attr in ["fc1_w", "fc1_b", "fc2_w", "fc2_b", "fc3_w", "fc3_b"]:
-                    arr = getattr(self.model.arith_solver, attr)
-                    flat = arr.flatten()
-                    for i in range(min(len(flat), 50)):
-                        idx = np.unravel_index(i, arr.shape)
-                        orig = arr[idx]
-                        arr[idx] = orig + eps
-                        pred_plus = self.model.arith_solver.predict(expr)
-                        if pred_plus is None:
-                            arr[idx] = orig
-                            continue
-                        loss_plus = (pred_plus - answer) ** 2
-                        grad = (loss_plus - loss) / eps
-                        arr[idx] = orig - self.lr * grad
-            if count > 0 and (epoch + 1) % 5 == 0:
-                print(f"  Arith epoch {epoch+1}/{epochs}, loss: {total_loss/count:.4f}")
+
+                # ---- backward ----
+                dz3 = np.array([2.0 * err], dtype=np.float32)      # (1,)
+                grad_fc3_w = np.outer(h2, dz3)
+                grad_fc3_b = dz3
+
+                dh2 = dz3 @ s.fc3_w.T                  # (64,)
+                dz2 = dh2 * gelu_grad(z2)
+                grad_fc2_w = np.outer(h1, dz2)
+                grad_fc2_b = dz2
+
+                dh1 = dz2 @ s.fc2_w.T                  # (hidden,)
+                dz1 = dh1 * gelu_grad(z1)
+                grad_fc1_w = np.outer(features, dz1)
+                grad_fc1_b = dz1
+
+                # ---- update ----
+                s.fc3_w -= self.lr * grad_fc3_w
+                s.fc3_b -= self.lr * grad_fc3_b
+                s.fc2_w -= self.lr * grad_fc2_w
+                s.fc2_b -= self.lr * grad_fc2_b
+                s.fc1_w -= self.lr * grad_fc1_w
+                s.fc1_b -= self.lr * grad_fc1_b
+
+            if count > 0:
+                print(f"  Arith epoch {epoch+1}/{epochs}, loss: {total_loss/count:.4f}", flush=True)
 
 
 # ============================================================
-# Neural Orchestration System (reasoning)
+# Neural Orchestration System
 # ============================================================
 class NeuralOrchestrationSystem:
     def __init__(self, num_workers: int = 8, num_neurons: int = 16,
@@ -777,51 +931,60 @@ class NeuralOrchestrationSystem:
         self.max_retries = min(max_retries, num_neurons)
         self.d_model = d_model
         self._init_components()
-        self.metrics = {"worker_outputs": 0, "orchestrator_scores": 0,
-                       "manager_routing_decisions": 0, "safety_filter_activations": 0,
-                       "verifier_acceptances": 0, "verifier_rejections": 0,
-                       "retry_attempts": 0, "retry_successes": 0, "unsafe_content_blocked": 0}
+        self.metrics = {
+            "worker_outputs": 0, "orchestrator_scores": 0,
+            "manager_routing_decisions": 0, "safety_filter_activations": 0,
+            "verifier_acceptances": 0, "verifier_rejections": 0,
+            "retry_attempts": 0, "retry_successes": 0, "unsafe_content_blocked": 0,
+        }
         print(f"Neural Orchestration: {num_workers} workers, {num_neurons} neurons, {max_retries} retries")
 
     def _init_components(self):
-        self.worker_nodes = [{"weights": np.random.randn(self.d_model, self.d_model).astype(np.float32)*0.02,
-                              "bias": np.random.randn(self.d_model).astype(np.float32)*0.02,
-                              "activation": "gelu"} for _ in range(self.num_workers)]
+        self.worker_nodes = [
+            {"weights": np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
+             "bias": np.random.randn(self.d_model).astype(np.float32) * 0.02,
+             "activation": "gelu"}
+            for _ in range(self.num_workers)
+        ]
         self.orchestrator = {
-            "scoring_weights": np.random.randn(self.d_model, self.num_neurons).astype(np.float32)*0.01,
-            "routing_weights": np.random.randn(self.d_model, self.num_neurons).astype(np.float32)*0.01,
-            "composite_weights": np.random.randn(self.num_neurons*2, 1).astype(np.float32)*0.01,
+            "scoring_weights":   np.random.randn(self.d_model, self.num_neurons).astype(np.float32) * 0.01,
+            "routing_weights":   np.random.randn(self.d_model, self.num_neurons).astype(np.float32) * 0.01,
+            "composite_weights": np.random.randn(self.num_neurons * 2, 1).astype(np.float32) * 0.01,
         }
-        self.manager_node = {"decision_threshold": 0.7,
-                            "selection_weights": np.random.randn(self.num_neurons, 1).astype(np.float32)*0.01}
+        self.manager_node = {
+            "decision_threshold": 0.7,
+            "selection_weights": np.random.randn(self.num_neurons, 1).astype(np.float32) * 0.01,
+        }
         self.safety_guardrail = {
-            "query_weights": np.random.randn(self.d_model, self.d_model).astype(np.float32)*0.02,
-            "key_weights": np.random.randn(self.d_model, self.d_model).astype(np.float32)*0.02,
-            "value_weights": np.random.randn(self.d_model, self.d_model).astype(np.float32)*0.02,
-            "bad_matrices": np.random.randn(self.d_model, 10).astype(np.float32)*0.1,
+            "query_weights":  np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
+            "key_weights":    np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
+            "value_weights":  np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
+            "bad_matrices":   np.random.randn(self.d_model, 10).astype(np.float32) * 0.1,
             "safety_threshold": 0.8,
         }
         self.verifier = {
             "normalization_factor": 1.0,
-            "aggregation_weights": np.random.randn(4, 1).astype(np.float32)*0.01,
+            "aggregation_weights": np.random.randn(4, 1).astype(np.float32) * 0.01,
             "acceptance_threshold": 0.3,
         }
         self.retry_policy = {"retry_counter": 0, "max_retries": self.max_retries, "retry_decay": 0.9}
 
     def get_state(self) -> dict:
-        return {"num_workers": self.num_workers, "num_neurons": self.num_neurons,
-                "max_retries": self.max_retries, "d_model": self.d_model,
-                "worker_nodes": [{"weights": n["weights"].copy(), "bias": n["bias"].copy(),
-                                  "activation": n["activation"]} for n in self.worker_nodes],
-                "orchestrator": {k: v.copy() for k, v in self.orchestrator.items()},
-                "manager_node": {k: v.copy() if isinstance(v, np.ndarray) else v
-                                 for k, v in self.manager_node.items()},
-                "safety_guardrail": {k: v.copy() if isinstance(v, np.ndarray) else v
-                                     for k, v in self.safety_guardrail.items()},
-                "verifier": {k: v.copy() if isinstance(v, np.ndarray) else v
-                             for k, v in self.verifier.items()},
-                "retry_policy": dict(self.retry_policy),
-                "orchestration_metrics": dict(self.metrics)}
+        return {
+            "num_workers": self.num_workers, "num_neurons": self.num_neurons,
+            "max_retries": self.max_retries, "d_model": self.d_model,
+            "worker_nodes": [{"weights": n["weights"].copy(), "bias": n["bias"].copy(),
+                              "activation": n["activation"]} for n in self.worker_nodes],
+            "orchestrator":    {k: v.copy() for k, v in self.orchestrator.items()},
+            "manager_node":    {k: v.copy() if isinstance(v, np.ndarray) else v
+                                for k, v in self.manager_node.items()},
+            "safety_guardrail":{k: v.copy() if isinstance(v, np.ndarray) else v
+                                for k, v in self.safety_guardrail.items()},
+            "verifier":        {k: v.copy() if isinstance(v, np.ndarray) else v
+                                for k, v in self.verifier.items()},
+            "retry_policy": dict(self.retry_policy),
+            "orchestration_metrics": dict(self.metrics),
+        }
 
     def restore_state(self, state: dict):
         self.num_workers = state["num_workers"]
@@ -829,29 +992,29 @@ class NeuralOrchestrationSystem:
         self.max_retries = state["max_retries"]
         self.d_model = state["d_model"]
         self.worker_nodes = state["worker_nodes"]
-        self.orchestrator = {k: v.copy() for k, v in state["orchestrator"].items()}
-        self.manager_node = {k: v.copy() if isinstance(v, np.ndarray) else v
-                             for k, v in state["manager_node"].items()}
-        self.safety_guardrail = {k: v.copy() if isinstance(v, np.ndarray) else v
-                                 for k, v in state["safety_guardrail"].items()}
-        self.verifier = {k: v.copy() if isinstance(v, np.ndarray) else v
-                         for k, v in state["verifier"].items()}
+        self.orchestrator    = {k: v.copy() for k, v in state["orchestrator"].items()}
+        self.manager_node    = {k: v.copy() if isinstance(v, np.ndarray) else v
+                                for k, v in state["manager_node"].items()}
+        self.safety_guardrail= {k: v.copy() if isinstance(v, np.ndarray) else v
+                                for k, v in state["safety_guardrail"].items()}
+        self.verifier        = {k: v.copy() if isinstance(v, np.ndarray) else v
+                                for k, v in state["verifier"].items()}
         self.retry_policy = dict(state["retry_policy"])
         if "orchestration_metrics" in state:
             self.metrics.update(state["orchestration_metrics"])
 
 
 # ============================================================
-# ScavengerDataset - auto-finds 8000 math JSON
+# ScavengerDataset
 # ============================================================
 class ScavengerDataset:
     def __init__(self, max_size: int = 8000, min_quality: float = 0.7,
                  auto_scavenge: bool = True, dataset_path: Optional[str] = None):
         self.max_size = max_size
         self.min_quality = min_quality
-        self.samples = []
-        self.sources_used = []
-        self.quality_scores = []
+        self.samples: List[str] = []
+        self.sources_used: List[str] = []
+        self.quality_scores: List[float] = []
 
         if dataset_path:
             self._load_path(dataset_path)
@@ -885,11 +1048,8 @@ class ScavengerDataset:
     def _load_json(self, path: str):
         with open(path, 'r') as f:
             data = json.load(f)
-        problems = data.get("problems", [])
-        for p in problems[:self.max_size]:
-            text = f"<math>{p['problem']}</math>"
-            answer = p.get("answer", "")
-            self.samples.append(text)
+        for p in data.get("problems", [])[:self.max_size]:
+            self.samples.append(f"<math>{p['problem']}</math>")
             self.quality_scores.append(0.95)
 
     def _generate_synthetic(self):
@@ -913,11 +1073,16 @@ class ScavengerDataset:
         return self.samples
 
     def get_quality_analysis(self) -> Dict:
-        return {"overall_quality": sum(self.quality_scores)/max(1, len(self.quality_scores)),
-                "quality_distribution": {"high": len([q for q in self.quality_scores if q >= 0.8]),
-                                         "medium": len([q for q in self.quality_scores if 0.5 <= q < 0.8]),
-                                         "low": len([q for q in self.quality_scores if q < 0.5])},
-                "sources_used": len(self.sources_used)}
+        qs = self.quality_scores
+        return {
+            "overall_quality": sum(qs) / max(1, len(qs)),
+            "quality_distribution": {
+                "high":   len([q for q in qs if q >= 0.8]),
+                "medium": len([q for q in qs if 0.5 <= q < 0.8]),
+                "low":    len([q for q in qs if q < 0.5]),
+            },
+            "sources_used": len(self.sources_used),
+        }
 
     def print_quality_report(self):
         qa = self.get_quality_analysis()
@@ -931,6 +1096,7 @@ class ScavengerDataset:
 # ============================================================
 CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 
+
 def find_latest_checkpoint() -> Optional[str]:
     if not os.path.isdir(CHECKPOINT_DIR):
         return None
@@ -940,12 +1106,14 @@ def find_latest_checkpoint() -> Optional[str]:
     ckpts.sort(key=lambda f: os.path.getmtime(os.path.join(CHECKPOINT_DIR, f)), reverse=True)
     return os.path.join(CHECKPOINT_DIR, ckpts[0])
 
+
 def load_checkpoint_state() -> Optional[Dict]:
     state_path = os.path.join(CHECKPOINT_DIR, "training_state.json")
     if os.path.exists(state_path):
         with open(state_path, "r") as f:
             return json.load(f)
     return None
+
 
 def save_checkpoint(model: NeuralMVModel, total_epochs: int, dataset_name: str):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -996,48 +1164,55 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
 
     dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
 
-    # Phase 1: Math Detector
+    # ---- Phase 1: Math Detector ----
     print("\n[1/4] Training Math Detector...")
     math_texts = [p["problem"] for p in problems[:500]]
     math_labels = [1] * 500
-    non_math = ["Hello how are you","The quick brown fox","What is the capital of France",
-                "I love programming","The weather is nice","Tell me a story",
-                "How do I bake a cake","Describe photosynthesis","Can you help me write",
-                "What is the meaning of life"]
+    non_math = [
+        "Hello how are you", "The quick brown fox", "What is the capital of France",
+        "I love programming", "The weather is nice", "Tell me a story",
+        "How do I bake a cake", "Describe photosynthesis", "Can you help me write",
+        "What is the meaning of life",
+    ]
     non_labels = [0] * len(non_math)
     trainer.train_detector(math_texts + non_math, math_labels + non_labels, epochs=epochs)
 
     for t in ["5 + 3", "Hello world", "Solve for x: 2x = 10"]:
         print(f"  '{t}' -> math: {model.detector.forward(t):.3f}")
 
-    # Phase 2: Type Classifier
+    # ---- Phase 2: Type Classifier ----
     print("\n[2/4] Training Type Classifier...")
-    type_map = {"Number Theory": 0, "Algebra": 1, "Combinatorics": 0,
-                "Geometry": 3, "Inequalities": 0, "Sequences": 0, "Diophantine Equations": 1}
-    type_texts = [p["problem"] for p in problems[:1000]]
+    type_map = {
+        "Number Theory": 0, "Algebra": 1, "Combinatorics": 0,
+        "Geometry": 3, "Inequalities": 0, "Sequences": 0, "Diophantine Equations": 1,
+    }
+    type_texts  = [p["problem"]  for p in problems[:1000]]
     type_labels = [type_map.get(p["category"], 4) for p in problems[:1000]]
     trainer.train_type_classifier(type_texts, type_labels, epochs=min(epochs, 3))
 
-    for t in ["Find the remainder when 50^56 is divided by 23",
-              "Solve the system: 2x + 7y = 35",
-              "Find the area of a circle with radius 5"]:
+    for t in [
+        "Find the remainder when 50^56 is divided by 23",
+        "Solve the system: 2x + 7y = 35",
+        "Find the area of a circle with radius 5",
+    ]:
         probs = model.type_classifier.get_probs(t)
-        print(f"  '{t[:50]}...' -> {max(probs, key=probs.get)} ({max(probs.values()):.3f})")
+        best = max(probs, key=probs.get)
+        print(f"  '{t[:50]}...' -> {best} ({probs[best]:.3f})")
 
-    # Phase 3: Arithmetic Solver
+    # ---- Phase 3: Arithmetic Solver ----
     print("\n[3/4] Training Arithmetic Solver...")
     arith_exprs, arith_answers = [], []
     for _ in range(1000):
         a, b = random.randint(1, 100), random.randint(1, 100)
         op = random.choice(["+", "-", "*"])
         if op == "+":
-            arith_exprs.append(f"{a}+{b}"); arith_answers.append(float(a + b))
+            arith_exprs.append(f"{a}+{b}");  arith_answers.append(float(a + b))
         elif op == "-":
-            if a >= b: arith_exprs.append(f"{a}-{b}"); arith_answers.append(float(a - b))
-            else: arith_exprs.append(f"{b}-{a}"); arith_answers.append(float(b - a))
+            lo, hi = min(a, b), max(a, b)
+            arith_exprs.append(f"{hi}-{lo}"); arith_answers.append(float(hi - lo))
         else:
             a, b = random.randint(1, 20), random.randint(1, 20)
-            arith_exprs.append(f"{a}*{b}"); arith_answers.append(float(a * b))
+            arith_exprs.append(f"{a}*{b}");  arith_answers.append(float(a * b))
     trainer.train_arith_solver(arith_exprs[:500], arith_answers[:500], epochs=min(epochs, 3))
 
     for expr in ["10+5", "20-3", "6*7"]:
@@ -1045,7 +1220,7 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
         if pred is not None:
             print(f"  {expr} -> {pred:.2f}")
 
-    # Phase 4: Evaluate
+    # ---- Phase 4: Evaluate ----
     print("\n[4/4] Evaluation on held-out set...")
     test = problems[7500:7600]
     correct, total = 0, 0
@@ -1054,10 +1229,7 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
         total += 1
         try:
             pred_str = str(result["result"])
-            if "=" in pred_str:
-                pred_val = float(pred_str.split("=")[-1].strip())
-            else:
-                pred_val = float(pred_str)
+            pred_val = float(pred_str.split("=")[-1].strip() if "=" in pred_str else pred_str)
             true_val = float(p["answer"])
             if abs(pred_val - true_val) / (abs(true_val) + 1e-8) < 0.01:
                 correct += 1
@@ -1076,32 +1248,29 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
 # Main
 # ============================================================
 if __name__ == "__main__":
-    # 1. Generate/find 8000 math problems
     print("\n=== ScavengerDataset: Auto-finding math JSON ===")
     dataset = ScavengerDataset(max_size=8000, auto_scavenge=True)
     print(f"Samples loaded: {dataset.get_sample_count()}")
 
-    # 2. Test tokenizer
     print("\n=== Tokenizer Test ===")
     tok = TekkenTokenizer(vocab_size=130000)
     test_text = "What is 25 plus 17?"
     tokens = tok.tokenize(test_text)
     ids = tok.encode(test_text)
     decoded = tok.decode(ids)
-    print(f"Text: {test_text}")
-    print(f"Tokens: {tokens}")
-    print(f"IDs: {ids[:10]}...")
+    print(f"Text:    {test_text}")
+    print(f"Tokens:  {tokens}")
+    print(f"IDs:     {ids[:10]}...")
     print(f"Decoded: {decoded}")
-    r2l = tok.tokenize_numbers_r2l("value is 1234 and 56.78")
-    print(f"R2L: {r2l}")
+    print(f"R2L:     {tok.tokenize_numbers_r2l('value is 1234 and 56.78')}")
 
-    # 3. Train Neural MV
     print("\n=== Neural MV Training ===")
     dataset_path = dataset.sources_used[0] if dataset.sources_used else None
     if dataset_path is None:
-        for f in os.listdir(os.path.dirname(os.path.abspath(__file__))):
+        base = os.path.dirname(os.path.abspath(__file__))
+        for f in os.listdir(base):
             if f.endswith('.json') and ('math' in f.lower() or 'synthetic' in f.lower()):
-                dataset_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f)
+                dataset_path = os.path.join(base, f)
                 break
     if dataset_path is None:
         print("ERROR: No math dataset found. Exiting.")
@@ -1115,12 +1284,8 @@ if __name__ == "__main__":
     else:
         print("No checkpoint found. Starting fresh training.")
 
-    mv_model = train_neural_mv(
-        dataset_path=dataset_path,
-        epochs=5, lr=0.01, resume=True,
-    )
+    mv_model = train_neural_mv(dataset_path=dataset_path, epochs=5, lr=0.01, resume=True)
 
-    # 4. Test trained MV model
     print("\n=== Post-Training Test ===")
     test_queries = [
         "What is 25 plus 17?",
@@ -1129,11 +1294,9 @@ if __name__ == "__main__":
         "Find the least common multiple of 71 and 141",
     ]
     for q in test_queries:
-        is_math = mv_model.is_math_query(q)
-        conf = mv_model.math_confidence(q)
         result = mv_model.solve(q)
         print(f"\nQ: {q}")
-        print(f"  Math: {is_math} ({conf:.3f})")
+        print(f"  Math: {mv_model.is_math_query(q)} ({mv_model.math_confidence(q):.3f})")
         print(f"  Type: {result['problem_type']} | Aim: {result['aim']}")
         print(f"  Engine: {result['engine']}")
         print(f"  Result: {result['result']}")
