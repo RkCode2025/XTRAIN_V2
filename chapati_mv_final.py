@@ -1,11 +1,12 @@
 """
 ChapatiLM MV Final: Clean Math Vision Pipeline
 ===============================================
-FIXED: Analytical backpropagation (replaces slow numerical finite-difference gradients)
-- train_detector: MSE + sigmoid output + analytical grads
-- train_type_classifier: cross-entropy + softmax + analytical grads
-- train_arith_solver: MSE + 3-layer analytical grads
-- Correct GELU derivative used throughout
+FIXES:
+1. Analytical backprop (no finite-diff)
+2. Gradient clipping + feature normalization in arith solver (fixes NaN)
+3. Balanced detector training data (fixes 0.881 for everything)
+4. Flexible type_map with auto-detection of dataset categories (fixes Unknown)
+5. Correct GELU derivative throughout
 """
 
 import sys
@@ -49,30 +50,41 @@ class TekkenTokenizer:
         vocab = dict(self.special_tokens)
         for i in range(32, 127):
             vocab[chr(i)] = len(vocab)
-        extended = ["\u20ac","\u00a3","\u00a5","\u00a9","\u00ae","\u2122","\u00b0","\u00b1",
-                    "\u00b5","\u00b7","\u00a7","\u00b6","\u2020","\u2021","\u2022","\u2026",
-                    "\u2013","\u2014","\u2764","\ud83d\udd25","\ud83d\ude80","\ud83d\udca1",
-                    "\ud83d\udcca","\ud83d\udd27","\ud83d\udcbb","\ud83d\udcf1","\ud83c\udf0d",
-                    "\ud83d\udd12","\ud83d\udd11","\ud83d\udcc8","\ud83d\udcc9","\ud83d\udcb0"]
+        extended = [
+            "\u20ac", "\u00a3", "\u00a5", "\u00a9", "\u00ae", "\u2122", "\u00b0", "\u00b1",
+            "\u00b5", "\u00b7", "\u00a7", "\u00b6", "\u2020", "\u2021", "\u2022", "\u2026",
+            "\u2013", "\u2014", "\u2764", "\ud83d\udd25", "\ud83d\ude80", "\ud83d\udca1",
+            "\ud83d\udcca", "\ud83d\udd27", "\ud83d\udcbb", "\ud83d\udcf1", "\ud83c\udf0d",
+            "\ud83d\udd12", "\ud83d\udd11", "\ud83d\udcc8", "\ud83d\udcc9", "\ud83d\udcb0",
+        ]
         for c in extended:
             if c not in vocab:
                 vocab[c] = len(vocab)
-        common_words = ["the","be","to","of","and","a","in","that","have","I","it","for","not",
-                        "on","with","he","as","you","do","at","this","but","his","by","from",
-                        "they","we","say","her","she","or","an","will","my","one","all","would",
-                        "there","their","what"]
+        common_words = [
+            "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
+            "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
+            "this", "but", "his", "by", "from", "they", "we", "say", "her",
+            "she", "or", "an", "will", "my", "one", "all", "would", "there",
+            "their", "what",
+        ]
         for w in common_words:
             if w not in vocab:
                 vocab[w] = len(vocab)
-        subwords = ["ing","ed","s","es","ly","tion","ment","ness","ful","less","un","re","pre",
-                    "dis","able","ible","al","ive","ize","ate","ify","hood","ship","dom"]
+        subwords = [
+            "ing", "ed", "s", "es", "ly", "tion", "ment", "ness", "ful", "less",
+            "un", "re", "pre", "dis", "able", "ible", "al", "ive", "ize", "ate",
+            "ify", "hood", "ship", "dom",
+        ]
         for sw in subwords:
             if sw not in vocab:
                 vocab[sw] = len(vocab)
-        byte_pairs = ["th","he","in","er","an","re","on","at","en","nd","ti","es","or","te","of",
-                      "ed","is","it","al","ar","st","to","ha","ng","se","ou","io","le","ve","co",
-                      "me","de","hi","ri","ro","ic","ne","ea","ra","ce","li","ch","ll","be","ma",
-                      "si","om","ur","ad","id"]
+        byte_pairs = [
+            "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "ti", "es",
+            "or", "te", "of", "ed", "is", "it", "al", "ar", "st", "to", "ha", "ng",
+            "se", "ou", "io", "le", "ve", "co", "me", "de", "hi", "ri", "ro", "ic",
+            "ne", "ea", "ra", "ce", "li", "ch", "ll", "be", "ma", "si", "om", "ur",
+            "ad", "id",
+        ]
         for bp in byte_pairs:
             if bp not in vocab:
                 vocab[bp] = len(vocab)
@@ -90,32 +102,32 @@ class TekkenTokenizer:
 
     def _build_merges(self) -> List[Tuple[str, str]]:
         return [
-            ("t","h"),("h","e"),("e"," "),(" ","t"),("t","o"),("o"," "),
-            (" ","a"),("a","n"),("n","d"),("d"," "),(" ","i"),("i","n"),
-            ("n"," "),(" ","s"),("s"," "),(" ","f"),("f","o"),("o","r"),
-            ("r"," "),(" ","w"),("w","i"),("i","t"),("t","h"),("h"," "),
-            (" ","b"),("b","e"),("e"," "),(" ","y"),("y","o"),("o","u"),
-            ("u"," "),(" ","c"),("c","a"),("a","n"),("n"," "),(" ","d"),
-            ("d","o"),("o"," "),(" ","h"),("h","a"),("a","v"),("v","e"),
-            ("e"," "),(" ","i"),("i","t"),("t"," "),(" ","t"),("t","h"),
-            ("h","a"),("a","t"),("t"," "),(" ","b"),("b","y"),("y"," "),
-            (" ","o"),("o","f"),("f"," "),(" ","t"),("t","h"),("h","i"),
-            ("i","s"),("s"," "),(" ","a"),("a","s"),("s"," "),(" ","w"),
-            ("w","e"),("e","r"),("r","e"),("e"," "),(" ","t"),("t","o"),
-            ("o"," "),(" ","b"),("b","e"),("e"," "),(" ","o"),("o","r"),
-            ("r"," "),(" ","n"),("n","o"),("o","t"),("t"," "),(" ","w"),
-            ("w","h"),("h","i"),("i","c"),("c","h"),("h"," "),(" ","a"),
-            ("a","r"),("r","e"),("e"," "),(" ","t"),("t","h"),("h","e"),
-            ("e","y"),("y"," "),(" ","w"),("w","e"),("e","r"),("r","e"),
-            ("e"," "),(" ","t"),("t","h"),("h","e"),("e","m"),("m"," "),
-            (" ","a"),("a","n"),("n","d"),("d"," "),(" ","t"),("t","h"),
-            ("h","e"),("e","i"),("i","r"),("r"," "),(" ","o"),("o","f"),
-            ("f"," "),(" ","t"),("t","h"),("h","e"),("e"," "),
-            ("in","g"),("ed"," "),("ly"," "),("ti","o"),("al"," "),
-            ("men","t"),("nes","s"),("ful"," "),("les","s"),
-            ("=","="),("!","="),("<","="),(">","="),("+","="),("-","="),
-            ("*","="),("/","="),("&","&"),("|","|"),("+","+"),("-","-"),
-            ("<","<"),(">",">"),("(",")"),("[","]"),("{","}"),
+            ("t", "h"), ("h", "e"), ("e", " "), (" ", "t"), ("t", "o"), ("o", " "),
+            (" ", "a"), ("a", "n"), ("n", "d"), ("d", " "), (" ", "i"), ("i", "n"),
+            ("n", " "), (" ", "s"), ("s", " "), (" ", "f"), ("f", "o"), ("o", "r"),
+            ("r", " "), (" ", "w"), ("w", "i"), ("i", "t"), ("t", "h"), ("h", " "),
+            (" ", "b"), ("b", "e"), ("e", " "), (" ", "y"), ("y", "o"), ("o", "u"),
+            ("u", " "), (" ", "c"), ("c", "a"), ("a", "n"), ("n", " "), (" ", "d"),
+            ("d", "o"), ("o", " "), (" ", "h"), ("h", "a"), ("a", "v"), ("v", "e"),
+            ("e", " "), (" ", "i"), ("i", "t"), ("t", " "), (" ", "t"), ("t", "h"),
+            ("h", "a"), ("a", "t"), ("t", " "), (" ", "b"), ("b", "y"), ("y", " "),
+            (" ", "o"), ("o", "f"), ("f", " "), (" ", "t"), ("t", "h"), ("h", "i"),
+            ("i", "s"), ("s", " "), (" ", "a"), ("a", "s"), ("s", " "), (" ", "w"),
+            ("w", "e"), ("e", "r"), ("r", "e"), ("e", " "), (" ", "t"), ("t", "o"),
+            ("o", " "), (" ", "b"), ("b", "e"), ("e", " "), (" ", "o"), ("o", "r"),
+            ("r", " "), (" ", "n"), ("n", "o"), ("o", "t"), ("t", " "), (" ", "w"),
+            ("w", "h"), ("h", "i"), ("i", "c"), ("c", "h"), ("h", " "), (" ", "a"),
+            ("a", "r"), ("r", "e"), ("e", " "), (" ", "t"), ("t", "h"), ("h", "e"),
+            ("e", "y"), ("y", " "), (" ", "w"), ("w", "e"), ("e", "r"), ("r", "e"),
+            ("e", " "), (" ", "t"), ("t", "h"), ("h", "e"), ("e", "m"), ("m", " "),
+            (" ", "a"), ("a", "n"), ("n", "d"), ("d", " "), (" ", "t"), ("t", "h"),
+            ("h", "e"), ("e", "i"), ("i", "r"), ("r", " "), (" ", "o"), ("o", "f"),
+            ("f", " "), (" ", "t"), ("t", "h"), ("h", "e"), ("e", " "),
+            ("in", "g"), ("ed", " "), ("ly", " "), ("ti", "o"), ("al", " "),
+            ("men", "t"), ("nes", "s"), ("ful", " "), ("les", "s"),
+            ("=", "="), ("!", "="), ("<", "="), (">", "="), ("+", "="), ("-", "="),
+            ("*", "="), ("/", "="), ("&", "&"), ("|", "|"), ("+", "+"), ("-", "-"),
+            ("<", "<"), (">", ">"), ("(", ")"), ("[", "]"), ("{", "}"),
         ]
 
     def _get_pairs(self, word: List[str]) -> List[Tuple[str, str]]:
@@ -142,12 +154,12 @@ class TekkenTokenizer:
             new_word = []
             i = 0
             while i < len(word):
-                if i < len(word)-1 and (word[i], word[i+1]) == best_pair:
-                    merged = word[i] + word[i+1]
+                if i < len(word) - 1 and (word[i], word[i + 1]) == best_pair:
+                    merged = word[i] + word[i + 1]
                     if merged in self.vocab:
                         new_word.append(merged)
                     else:
-                        new_word.extend([word[i], word[i+1]])
+                        new_word.extend([word[i], word[i + 1]])
                     i += 2
                 else:
                     new_word.append(word[i])
@@ -187,7 +199,9 @@ class TekkenTokenizer:
             ns = m.group()
             if '.' in ns:
                 ip, dp = ns.split('.')
-                tokens.extend(['<num>'] + list(reversed(ip)) + ['<dec>'] + list(reversed(dp)) + ['</num>'])
+                tokens.extend(
+                    ['<num>'] + list(reversed(ip)) + ['<dec>'] + list(reversed(dp)) + ['</num>']
+                )
             else:
                 tokens.extend(['<num>'] + list(reversed(ns)) + ['</num>'])
             last = m.end()
@@ -200,7 +214,7 @@ class TekkenTokenizer:
 
 
 # ============================================================
-# Neural MV Components
+# Shared activation functions
 # ============================================================
 CHAR_VOCAB = "abcdefghijklmnopqrstuvwxyz0123456789 +-*/=().%^<>,!?&|~@#$:;\"'\\/\n\t"
 CHAR_TO_IDX = {c: i for i, c in enumerate(CHAR_VOCAB)}
@@ -222,16 +236,18 @@ def char_ids_to_embedding(char_ids: np.ndarray, embed_matrix: np.ndarray) -> np.
 
 
 def gelu(x: np.ndarray) -> np.ndarray:
-    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
 
 
 def gelu_grad(x: np.ndarray) -> np.ndarray:
     """Correct analytical derivative of GELU."""
-    k = 0.7978845608  # sqrt(2/pi)
-    tanh_arg = k * (x + 0.044715 * x**3)
+    k = 0.7978845608
+    tanh_arg = k * (x + 0.044715 * x ** 3)
+    # clip before tanh to prevent overflow in x**3 for large x
+    tanh_arg = np.clip(tanh_arg, -20, 20)
     tanh_val = np.tanh(tanh_arg)
-    sech2 = 1.0 - tanh_val**2
-    return 0.5 * (1.0 + tanh_val) + 0.5 * x * sech2 * k * (1.0 + 3.0 * 0.044715 * x**2)
+    sech2 = 1.0 - tanh_val ** 2
+    return 0.5 * (1.0 + tanh_val) + 0.5 * x * sech2 * k * (1.0 + 3.0 * 0.044715 * x ** 2)
 
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
@@ -239,13 +255,17 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
 
 
 def sigmoid_grad(s: np.ndarray) -> np.ndarray:
-    """Derivative of sigmoid given sigmoid output s."""
     return s * (1.0 - s)
 
 
 def softmax(x: np.ndarray) -> np.ndarray:
     e = np.exp(x - np.max(x))
     return e / (e.sum() + 1e-10)
+
+
+def clip_grads(*grads, clip: float = 1.0):
+    for g in grads:
+        np.clip(g, -clip, clip, out=g)
 
 
 # ============================================================
@@ -326,10 +346,8 @@ class NeuralTypeClassifier:
 
     def load_weights(self, w: Dict):
         self.char_embedding = w["char_embedding"].copy()
-        self.fc1_w = w["fc1_w"].copy()
-        self.fc1_b = w["fc1_b"].copy()
-        self.fc2_w = w["fc2_w"].copy()
-        self.fc2_b = w["fc2_b"].copy()
+        self.fc1_w = w["fc1_w"].copy(); self.fc1_b = w["fc1_b"].copy()
+        self.fc2_w = w["fc2_w"].copy(); self.fc2_b = w["fc2_b"].copy()
 
 
 # ============================================================
@@ -371,10 +389,8 @@ class NeuralAimClassifier:
 
     def load_weights(self, w: Dict):
         self.char_embedding = w["char_embedding"].copy()
-        self.fc1_w = w["fc1_w"].copy()
-        self.fc1_b = w["fc1_b"].copy()
-        self.fc2_w = w["fc2_w"].copy()
-        self.fc2_b = w["fc2_b"].copy()
+        self.fc1_w = w["fc1_w"].copy(); self.fc1_b = w["fc1_b"].copy()
+        self.fc2_w = w["fc2_w"].copy(); self.fc2_b = w["fc2_b"].copy()
 
 
 # ============================================================
@@ -405,10 +421,8 @@ class NeuralSymbolicRouter:
         }
 
     def load_weights(self, w: Dict):
-        self.fc_w = w["fc_w"].copy()
-        self.fc_b = w["fc_b"].copy()
-        self.out_w = w["out_w"].copy()
-        self.out_b = w["out_b"].copy()
+        self.fc_w = w["fc_w"].copy(); self.fc_b = w["fc_b"].copy()
+        self.out_w = w["out_w"].copy(); self.out_b = w["out_b"].copy()
 
 
 # ============================================================
@@ -422,12 +436,10 @@ class NeuralMathFilter:
 
     def filter(self, text: str, threshold: float = 0.5) -> str:
         text = text.lower()
-        # Vectorized: score all chars at once instead of looping with a forward pass per char
         char_ids = np.array([CHAR_TO_IDX.get(c, 0) for c in text], dtype=np.int32)
-        embeds = self.char_embedding[char_ids]          # (T, embed_dim)
-        scores = sigmoid(embeds @ self.fc_w + self.fc_b).squeeze(-1)  # (T,)
-        result = [c for c, score in zip(text, scores)
-                  if c == ' ' or score >= threshold]
+        embeds = self.char_embedding[char_ids]
+        scores = sigmoid(embeds @ self.fc_w + self.fc_b).squeeze(-1)
+        result = [c for c, score in zip(text, scores) if c == ' ' or score >= threshold]
         return re.sub(r'\s+', ' ', ''.join(result)).strip()
 
     def get_weights(self) -> Dict:
@@ -438,8 +450,7 @@ class NeuralMathFilter:
 
     def load_weights(self, w: Dict):
         self.char_embedding = w["char_embedding"].copy()
-        self.fc_w = w["fc_w"].copy()
-        self.fc_b = w["fc_b"].copy()
+        self.fc_w = w["fc_w"].copy(); self.fc_b = w["fc_b"].copy()
 
 
 # ============================================================
@@ -447,15 +458,18 @@ class NeuralMathFilter:
 # ============================================================
 class NeuralOperatorMapper:
     OPERATORS = ["+", "-", "*", "/", "=", "^", "%", ">", "<", "**"]
-    KNOWN_WORDS = ["plus","add","sum","added","minus","subtract","difference","less","spends",
-                   "times","multiply","product","multiplied","divided","divide","quotient","over",
-                   "power","raised","squared","cubed","mod","modulo","remainder",
-                   "equals","equal","is","gives","greater","gt","lt"]
+    KNOWN_WORDS = [
+        "plus", "add", "sum", "added", "minus", "subtract", "difference", "less", "spends",
+        "times", "multiply", "product", "multiplied", "divided", "divide", "quotient", "over",
+        "power", "raised", "squared", "cubed", "mod", "modulo", "remainder",
+        "equals", "equal", "is", "gives", "greater", "gt", "lt",
+    ]
 
     def __init__(self, embed_dim: int = 32):
         self.embed_dim = embed_dim
-        self.word_embeddings = {w: np.random.randn(embed_dim).astype(np.float32) * 0.1
-                                for w in self.KNOWN_WORDS}
+        self.word_embeddings = {
+            w: np.random.randn(embed_dim).astype(np.float32) * 0.1 for w in self.KNOWN_WORDS
+        }
         self.op_embeddings = np.random.randn(len(self.OPERATORS), embed_dim).astype(np.float32) * 0.1
         self.proj_w = np.random.randn(embed_dim, embed_dim).astype(np.float32) * 0.1
         self.proj_b = np.zeros(embed_dim, dtype=np.float32)
@@ -489,8 +503,7 @@ class NeuralOperatorMapper:
 
     def load_weights(self, w: Dict):
         self.op_embeddings = w["op_embeddings"].copy()
-        self.proj_w = w["proj_w"].copy()
-        self.proj_b = w["proj_b"].copy()
+        self.proj_w = w["proj_w"].copy(); self.proj_b = w["proj_b"].copy()
 
 
 # ============================================================
@@ -504,6 +517,7 @@ class NeuralArithmeticSolver:
         self.fc2_b = np.zeros(64, dtype=np.float32)
         self.fc3_w = np.random.randn(64, 1).astype(np.float32) * 0.01
         self.fc3_b = np.zeros(1, dtype=np.float32)
+        self._answer_scale = 1.0  # set during training, used at inference
 
     def _extract_features(self, expression: str) -> Optional[np.ndarray]:
         cleaned = re.sub(r'\s+', '', expression).replace('^', '**')
@@ -524,27 +538,35 @@ class NeuralArithmeticSolver:
         features = self._extract_features(expression)
         if features is None:
             return None
+        scale = self._answer_scale
+        features = features.copy()
+        features[0] /= (scale + 1e-8)
+        features[1] /= (scale + 1e-8)
         h1 = gelu(cpuwarp_ml.matmul(features, self.fc1_w) + self.fc1_b)
         h2 = gelu(cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b)
-        return float((cpuwarp_ml.matmul(h2, self.fc3_w) + self.fc3_b)[0])
+        raw = float((cpuwarp_ml.matmul(h2, self.fc3_w) + self.fc3_b)[0])
+        return raw * scale
 
     def solve(self, expression: str) -> Optional[str]:
         result = self.predict(expression)
         if result is None:
             return None
-        return str(int(result)) if result == int(result) else f"{result:.6g}"
+        return str(int(round(result))) if abs(result - round(result)) < 0.01 else f"{result:.6g}"
 
     def get_weights(self) -> Dict:
         return {
             "fc1_w": self.fc1_w.copy(), "fc1_b": self.fc1_b.copy(),
             "fc2_w": self.fc2_w.copy(), "fc2_b": self.fc2_b.copy(),
             "fc3_w": self.fc3_w.copy(), "fc3_b": self.fc3_b.copy(),
+            "_answer_scale": np.array([self._answer_scale]),
         }
 
     def load_weights(self, w: Dict):
         self.fc1_w = w["fc1_w"].copy(); self.fc1_b = w["fc1_b"].copy()
         self.fc2_w = w["fc2_w"].copy(); self.fc2_b = w["fc2_b"].copy()
         self.fc3_w = w["fc3_w"].copy(); self.fc3_b = w["fc3_b"].copy()
+        if "_answer_scale" in w:
+            self._answer_scale = float(w["_answer_scale"][0])
 
 
 # ============================================================
@@ -562,7 +584,8 @@ class NeuralAlgebraicSolver:
     def _parse_linear(self, expression: str) -> Optional[Tuple[float, float, float]]:
         match = re.match(
             r'([\d\.\+\-\*/\*\s]*)\s*([a-zA-Z])\s*([\+\-\d\.\*/\s]*)\s*=\s*([\d\.\+\-\*/\s]*)',
-            expression)
+            expression,
+        )
         if not match:
             return None
         try:
@@ -591,7 +614,7 @@ class NeuralAlgebraicSolver:
         result = self.predict(expression)
         if result is None:
             return None
-        return f"x = {int(result)}" if result == int(result) else f"x = {result:.6g}"
+        return f"x = {int(round(result))}" if abs(result - round(result)) < 0.01 else f"x = {result:.6g}"
 
     def get_weights(self) -> Dict:
         return {
@@ -714,15 +737,15 @@ class NeuralMVModel:
 
     def get_all_weights(self) -> Dict:
         return {
-            "math_detector":    self.detector.get_weights(),
-            "type_classifier":  self.type_classifier.get_weights(),
-            "aim_classifier":   self.aim_classifier.get_weights(),
-            "symbolic_router":  self.symbolic_router.get_weights(),
-            "math_filter":      self.math_filter.get_weights(),
-            "op_mapper":        self.op_mapper.get_weights(),
-            "arith_solver":     self.arith_solver.get_weights(),
-            "algebra_solver":   self.algebra_solver.get_weights(),
-            "comparison_solver":self.comparison_solver.get_weights(),
+            "math_detector":     self.detector.get_weights(),
+            "type_classifier":   self.type_classifier.get_weights(),
+            "aim_classifier":    self.aim_classifier.get_weights(),
+            "symbolic_router":   self.symbolic_router.get_weights(),
+            "math_filter":       self.math_filter.get_weights(),
+            "op_mapper":         self.op_mapper.get_weights(),
+            "arith_solver":      self.arith_solver.get_weights(),
+            "algebra_solver":    self.algebra_solver.get_weights(),
+            "comparison_solver": self.comparison_solver.get_weights(),
         }
 
     def load_all_weights(self, weights: Dict):
@@ -737,58 +760,57 @@ class NeuralMVModel:
         self.comparison_solver.load_weights(weights.get("comparison_solver", {}))
 
     def count_weights(self) -> int:
-        return sum(arr.size for cw in self.get_all_weights().values() for arr in cw.values())
+        return sum(
+            arr.size for cw in self.get_all_weights().values()
+            for arr in cw.values() if isinstance(arr, np.ndarray)
+        )
 
 
 # ============================================================
-# NeuralMVTrainer  —  ALL analytical backprop, zero finite-diff
+# NeuralMVTrainer — full analytical backprop, grad clipping
 # ============================================================
 class NeuralMVTrainer:
     def __init__(self, model: NeuralMVModel, lr: float = 0.001):
         self.model = model
         self.lr = lr
 
-    # ----------------------------------------------------------
-    # Helper: embed text → pooled vector + cached intermediate
-    # ----------------------------------------------------------
-    def _embed(self, text: str, embed_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Returns (pooled, embeds) where embeds shape is (MAX_SEQ_LEN, embed_dim)."""
+    def _embed(self, text: str, embed_matrix: np.ndarray):
         char_ids = text_to_char_ids(text)
-        embeds = embed_matrix[char_ids]         # (T, D)
-        pooled = embeds.mean(axis=0)            # (D,)
+        embeds = embed_matrix[char_ids]
+        pooled = embeds.mean(axis=0)
         return pooled, embeds, char_ids
 
     # ----------------------------------------------------------
-    # 1. Train detector  (binary MSE + sigmoid output)
+    # 1. Detector — binary MSE + sigmoid
     # ----------------------------------------------------------
     def train_detector(self, texts: List[str], labels: List[int], epochs: int = 10):
         d = self.model.detector
         for epoch in range(epochs):
             total_loss = 0.0
-            for text, label in zip(texts, labels):
-                # ---- forward ----
-                pooled, embeds, char_ids = self._embed(text, d.char_embedding)
-                z1 = pooled @ d.fc1_w + d.fc1_b        # (32,)
+            # shuffle each epoch
+            idxs = list(range(len(texts)))
+            random.shuffle(idxs)
+            for i in idxs:
+                text, label = texts[i], labels[i]
+                pooled, _, _ = self._embed(text, d.char_embedding)
+                z1 = pooled @ d.fc1_w + d.fc1_b
                 h1 = gelu(z1)
-                z2 = h1 @ d.fc2_w + d.fc2_b            # (1,)
-                pred = sigmoid(z2)                      # (1,)
-                err = pred - label                      # scalar-ish
+                z2 = h1 @ d.fc2_w + d.fc2_b
+                pred = sigmoid(z2)
+                err = pred - label
                 loss = float((err ** 2).sum())
                 total_loss += loss
 
-                # ---- backward ----
-                # dL/dz2
-                dz2 = 2.0 * err * sigmoid_grad(pred)   # (1,)
-                grad_fc2_w = np.outer(h1, dz2)          # (32,1)
-                grad_fc2_b = dz2                        # (1,)
+                dz2 = 2.0 * err * sigmoid_grad(pred)
+                grad_fc2_w = np.outer(h1, dz2)
+                grad_fc2_b = dz2
+                dh1 = dz2 @ d.fc2_w.T
+                dz1 = dh1 * gelu_grad(z1)
+                grad_fc1_w = np.outer(pooled, dz1)
+                grad_fc1_b = dz1
 
-                # dL/dh1 → dL/dz1
-                dh1 = dz2 @ d.fc2_w.T                  # (32,)
-                dz1 = dh1 * gelu_grad(z1)              # (32,)
-                grad_fc1_w = np.outer(pooled, dz1)      # (embed_dim, 32)
-                grad_fc1_b = dz1                        # (32,)
+                clip_grads(grad_fc2_w, grad_fc2_b, grad_fc1_w, grad_fc1_b)
 
-                # ---- update ----
                 d.fc2_w -= self.lr * grad_fc2_w
                 d.fc2_b -= self.lr * grad_fc2_b
                 d.fc1_w -= self.lr * grad_fc1_w
@@ -797,37 +819,37 @@ class NeuralMVTrainer:
             print(f"  Detector epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
 
     # ----------------------------------------------------------
-    # 2. Train type classifier  (cross-entropy + softmax)
+    # 2. Type classifier — cross-entropy + softmax
     # ----------------------------------------------------------
     def train_type_classifier(self, texts: List[str], labels: List[int], epochs: int = 10):
         tc = self.model.type_classifier
         for epoch in range(epochs):
             total_loss = 0.0
-            for text, label in zip(texts, labels):
-                # ---- forward ----
-                pooled, embeds, char_ids = self._embed(text, tc.char_embedding)
-                z1 = pooled @ tc.fc1_w + tc.fc1_b      # (hidden,)
+            idxs = list(range(len(texts)))
+            random.shuffle(idxs)
+            for i in idxs:
+                text, label = texts[i], labels[i]
+                pooled, _, _ = self._embed(text, tc.char_embedding)
+                z1 = pooled @ tc.fc1_w + tc.fc1_b
                 h1 = gelu(z1)
-                logits = h1 @ tc.fc2_w + tc.fc2_b      # (NUM_TYPES,)
-                probs = softmax(logits)                 # (NUM_TYPES,)
+                logits = h1 @ tc.fc2_w + tc.fc2_b
+                probs = softmax(logits)
 
                 target = np.zeros(tc.NUM_TYPES, dtype=np.float32)
                 target[label] = 1.0
                 loss = -float(np.sum(target * np.log(probs + 1e-10)))
                 total_loss += loss
 
-                # ---- backward ----
-                # Gradient of cross-entropy + softmax combined = probs - target
-                dlogits = probs - target                # (NUM_TYPES,)
-                grad_fc2_w = np.outer(h1, dlogits)      # (hidden, NUM_TYPES)
+                dlogits = probs - target
+                grad_fc2_w = np.outer(h1, dlogits)
                 grad_fc2_b = dlogits
-
-                dh1 = dlogits @ tc.fc2_w.T             # (hidden,)
+                dh1 = dlogits @ tc.fc2_w.T
                 dz1 = dh1 * gelu_grad(z1)
                 grad_fc1_w = np.outer(pooled, dz1)
                 grad_fc1_b = dz1
 
-                # ---- update ----
+                clip_grads(grad_fc2_w, grad_fc2_b, grad_fc1_w, grad_fc1_b)
+
                 tc.fc2_w -= self.lr * grad_fc2_w
                 tc.fc2_b -= self.lr * grad_fc2_b
                 tc.fc1_w -= self.lr * grad_fc1_w
@@ -836,7 +858,7 @@ class NeuralMVTrainer:
             print(f"  Type epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
 
     # ----------------------------------------------------------
-    # 3. Train aim classifier  (same structure as type)
+    # 3. Aim classifier — same structure as type
     # ----------------------------------------------------------
     def train_aim_classifier(self, texts: List[str], labels: List[int], epochs: int = 10):
         ac = self.model.aim_classifier
@@ -862,6 +884,8 @@ class NeuralMVTrainer:
                 grad_fc1_w = np.outer(pooled, dz1)
                 grad_fc1_b = dz1
 
+                clip_grads(grad_fc2_w, grad_fc2_b, grad_fc1_w, grad_fc1_b)
+
                 ac.fc2_w -= self.lr * grad_fc2_w
                 ac.fc2_b -= self.lr * grad_fc2_b
                 ac.fc1_w -= self.lr * grad_fc1_w
@@ -870,45 +894,59 @@ class NeuralMVTrainer:
             print(f"  Aim epoch {epoch+1}/{epochs}, loss: {total_loss/len(texts):.4f}", flush=True)
 
     # ----------------------------------------------------------
-    # 4. Train arithmetic solver  (MSE, 3-layer)
+    # 4. Arith solver — MSE 3-layer + normalization + clipping
     # ----------------------------------------------------------
     def train_arith_solver(self, expressions: List[str], answers: List[float], epochs: int = 10):
         s = self.model.arith_solver
+
+        # FIX: normalize so targets are in [-1, 1] — prevents overflow in GELU
+        max_ans = max(abs(a) for a in answers) + 1e-8
+        s._answer_scale = max_ans
+        norm_answers = [a / max_ans for a in answers]
+
         for epoch in range(epochs):
             total_loss, count = 0.0, 0
-            for expr, answer in zip(expressions, answers):
-                features = s._extract_features(expr)
-                if features is None:
+            for expr, norm_answer in zip(expressions, norm_answers):
+                raw_features = s._extract_features(expr)
+                if raw_features is None:
                     continue
 
-                # ---- forward ----
-                z1 = features @ s.fc1_w + s.fc1_b      # (hidden,)
+                # normalize input magnitudes to match target scale
+                features = raw_features.copy()
+                features[0] /= (max_ans + 1e-8)
+                features[1] /= (max_ans + 1e-8)
+
+                z1 = features @ s.fc1_w + s.fc1_b
                 h1 = gelu(z1)
-                z2 = h1 @ s.fc2_w + s.fc2_b            # (64,)
+                z2 = h1 @ s.fc2_w + s.fc2_b
                 h2 = gelu(z2)
-                z3 = h2 @ s.fc3_w + s.fc3_b            # (1,)
+                z3 = h2 @ s.fc3_w + s.fc3_b
                 pred = z3[0]
-                err = pred - answer
+                err = pred - norm_answer
                 loss = err ** 2
                 total_loss += loss
                 count += 1
 
-                # ---- backward ----
-                dz3 = np.array([2.0 * err], dtype=np.float32)      # (1,)
+                dz3 = np.array([2.0 * err], dtype=np.float32)
                 grad_fc3_w = np.outer(h2, dz3)
                 grad_fc3_b = dz3
-
-                dh2 = dz3 @ s.fc3_w.T                  # (64,)
+                dh2 = dz3 @ s.fc3_w.T
                 dz2 = dh2 * gelu_grad(z2)
                 grad_fc2_w = np.outer(h1, dz2)
                 grad_fc2_b = dz2
-
-                dh1 = dz2 @ s.fc2_w.T                  # (hidden,)
+                dh1 = dz2 @ s.fc2_w.T
                 dz1 = dh1 * gelu_grad(z1)
                 grad_fc1_w = np.outer(features, dz1)
                 grad_fc1_b = dz1
 
-                # ---- update ----
+                # FIX: clip gradients to prevent NaN cascade
+                clip_grads(
+                    grad_fc3_w, grad_fc3_b,
+                    grad_fc2_w, grad_fc2_b,
+                    grad_fc1_w, grad_fc1_b,
+                    clip=1.0,
+                )
+
                 s.fc3_w -= self.lr * grad_fc3_w
                 s.fc3_b -= self.lr * grad_fc3_b
                 s.fc2_w -= self.lr * grad_fc2_w
@@ -917,7 +955,7 @@ class NeuralMVTrainer:
                 s.fc1_b -= self.lr * grad_fc1_b
 
             if count > 0:
-                print(f"  Arith epoch {epoch+1}/{epochs}, loss: {total_loss/count:.4f}", flush=True)
+                print(f"  Arith epoch {epoch+1}/{epochs}, loss: {total_loss/count:.6f}", flush=True)
 
 
 # ============================================================
@@ -941,9 +979,11 @@ class NeuralOrchestrationSystem:
 
     def _init_components(self):
         self.worker_nodes = [
-            {"weights": np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
-             "bias": np.random.randn(self.d_model).astype(np.float32) * 0.02,
-             "activation": "gelu"}
+            {
+                "weights": np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
+                "bias": np.random.randn(self.d_model).astype(np.float32) * 0.02,
+                "activation": "gelu",
+            }
             for _ in range(self.num_workers)
         ]
         self.orchestrator = {
@@ -956,32 +996,33 @@ class NeuralOrchestrationSystem:
             "selection_weights": np.random.randn(self.num_neurons, 1).astype(np.float32) * 0.01,
         }
         self.safety_guardrail = {
-            "query_weights":  np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
-            "key_weights":    np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
-            "value_weights":  np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
-            "bad_matrices":   np.random.randn(self.d_model, 10).astype(np.float32) * 0.1,
+            "query_weights":    np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
+            "key_weights":      np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
+            "value_weights":    np.random.randn(self.d_model, self.d_model).astype(np.float32) * 0.02,
+            "bad_matrices":     np.random.randn(self.d_model, 10).astype(np.float32) * 0.1,
             "safety_threshold": 0.8,
         }
         self.verifier = {
             "normalization_factor": 1.0,
-            "aggregation_weights": np.random.randn(4, 1).astype(np.float32) * 0.01,
+            "aggregation_weights":  np.random.randn(4, 1).astype(np.float32) * 0.01,
             "acceptance_threshold": 0.3,
         }
-        self.retry_policy = {"retry_counter": 0, "max_retries": self.max_retries, "retry_decay": 0.9}
+        self.retry_policy = {
+            "retry_counter": 0, "max_retries": self.max_retries, "retry_decay": 0.9,
+        }
 
     def get_state(self) -> dict:
         return {
             "num_workers": self.num_workers, "num_neurons": self.num_neurons,
             "max_retries": self.max_retries, "d_model": self.d_model,
-            "worker_nodes": [{"weights": n["weights"].copy(), "bias": n["bias"].copy(),
-                              "activation": n["activation"]} for n in self.worker_nodes],
-            "orchestrator":    {k: v.copy() for k, v in self.orchestrator.items()},
-            "manager_node":    {k: v.copy() if isinstance(v, np.ndarray) else v
-                                for k, v in self.manager_node.items()},
-            "safety_guardrail":{k: v.copy() if isinstance(v, np.ndarray) else v
-                                for k, v in self.safety_guardrail.items()},
-            "verifier":        {k: v.copy() if isinstance(v, np.ndarray) else v
-                                for k, v in self.verifier.items()},
+            "worker_nodes": [
+                {"weights": n["weights"].copy(), "bias": n["bias"].copy(), "activation": n["activation"]}
+                for n in self.worker_nodes
+            ],
+            "orchestrator":     {k: v.copy() for k, v in self.orchestrator.items()},
+            "manager_node":     {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in self.manager_node.items()},
+            "safety_guardrail": {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in self.safety_guardrail.items()},
+            "verifier":         {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in self.verifier.items()},
             "retry_policy": dict(self.retry_policy),
             "orchestration_metrics": dict(self.metrics),
         }
@@ -992,13 +1033,10 @@ class NeuralOrchestrationSystem:
         self.max_retries = state["max_retries"]
         self.d_model = state["d_model"]
         self.worker_nodes = state["worker_nodes"]
-        self.orchestrator    = {k: v.copy() for k, v in state["orchestrator"].items()}
-        self.manager_node    = {k: v.copy() if isinstance(v, np.ndarray) else v
-                                for k, v in state["manager_node"].items()}
-        self.safety_guardrail= {k: v.copy() if isinstance(v, np.ndarray) else v
-                                for k, v in state["safety_guardrail"].items()}
-        self.verifier        = {k: v.copy() if isinstance(v, np.ndarray) else v
-                                for k, v in state["verifier"].items()}
+        self.orchestrator     = {k: v.copy() for k, v in state["orchestrator"].items()}
+        self.manager_node     = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in state["manager_node"].items()}
+        self.safety_guardrail = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in state["safety_guardrail"].items()}
+        self.verifier         = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in state["verifier"].items()}
         self.retry_policy = dict(state["retry_policy"])
         if "orchestration_metrics" in state:
             self.metrics.update(state["orchestration_metrics"])
@@ -1132,6 +1170,57 @@ def save_checkpoint(model: NeuralMVModel, total_epochs: int, dataset_name: str):
 
 
 # ============================================================
+# Build type_map dynamically from actual dataset categories
+# ============================================================
+def build_type_map(problems: List[Dict]) -> Dict[str, int]:
+    """
+    Auto-detect category names from the dataset and map them to type indices.
+    Falls back gracefully — unknown categories get label 4 (Unknown).
+    Prints what it found so you can verify.
+    """
+    actual_cats = set(p.get("category", "unknown") for p in problems)
+    print(f"  Actual categories in dataset: {actual_cats}")
+
+    # Comprehensive map covering common naming conventions
+    base_map = {
+        # Arithmetic variants
+        "arithmetic": 0, "Arithmetic": 0, "ARITHMETIC": 0,
+        "Number Theory": 0, "number_theory": 0, "number theory": 0,
+        "Combinatorics": 0, "combinatorics": 0,
+        "Sequences": 0, "sequences": 0,
+        "Inequalities": 0, "inequalities": 0,
+        "word_problem": 0, "Word Problem": 0, "word problem": 0,
+        "Math-QSA": 0,
+
+        # Algebra variants
+        "algebra": 1, "Algebra": 1, "ALGEBRA": 1,
+        "Algebraic": 1, "algebraic": 1,
+        "Diophantine Equations": 1, "diophantine": 1,
+        "linear_algebra": 1, "Linear Algebra": 1,
+
+        # Comparison variants
+        "comparison": 2, "Comparison": 2, "COMPARISON": 2,
+
+        # Geometry variants
+        "geometry": 3, "Geometry": 3, "GEOMETRY": 3,
+        "Geometric": 3, "geometric": 3,
+        "trigonometry": 3, "Trigonometry": 3,
+
+        # GSM8K-style
+        "GSM8K-Reasoning": 0,
+    }
+
+    # For any category found in the dataset not in the map, assign Unknown (4)
+    final_map = {}
+    for cat in actual_cats:
+        final_map[cat] = base_map.get(cat, 4)
+
+    # Print the resolved mapping
+    print(f"  Resolved type_map: {final_map}")
+    return final_map
+
+
+# ============================================================
 # Training Pipeline
 # ============================================================
 def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
@@ -1161,20 +1250,29 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
 
     trainer = NeuralMVTrainer(model, lr=lr)
     print(f"Learnable parameters: {model.count_weights():,}")
-
     dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
 
     # ---- Phase 1: Math Detector ----
     print("\n[1/4] Training Math Detector...")
-    math_texts = [p["problem"] for p in problems[:500]]
-    math_labels = [1] * 500
-    non_math = [
+    n_math = min(500, len(problems))
+    math_texts = [p["problem"] for p in problems[:n_math]]
+    math_labels = [1] * n_math
+
+    # FIX: balanced non-math set — same size as math set
+    non_math_base = [
         "Hello how are you", "The quick brown fox", "What is the capital of France",
-        "I love programming", "The weather is nice", "Tell me a story",
-        "How do I bake a cake", "Describe photosynthesis", "Can you help me write",
-        "What is the meaning of life",
+        "I love programming", "The weather is nice today", "Tell me a story",
+        "How do I bake a cake", "Describe photosynthesis please", "Can you help me write",
+        "What is the meaning of life", "Who wrote Hamlet", "The sky is blue",
+        "I went to the market yesterday", "She loves reading books", "The cat sat on the mat",
+        "History of the Roman Empire", "How to cook pasta", "Best movies of 2024",
+        "What is machine learning", "How do plants grow",
     ]
+    # repeat to match math count
+    reps = (n_math // len(non_math_base)) + 1
+    non_math = (non_math_base * reps)[:n_math]
     non_labels = [0] * len(non_math)
+
     trainer.train_detector(math_texts + non_math, math_labels + non_labels, epochs=epochs)
 
     for t in ["5 + 3", "Hello world", "Solve for x: 2x = 10"]:
@@ -1182,12 +1280,15 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
 
     # ---- Phase 2: Type Classifier ----
     print("\n[2/4] Training Type Classifier...")
-    type_map = {
-        "Number Theory": 0, "Algebra": 1, "Combinatorics": 0,
-        "Geometry": 3, "Inequalities": 0, "Sequences": 0, "Diophantine Equations": 1,
-    }
-    type_texts  = [p["problem"]  for p in problems[:1000]]
-    type_labels = [type_map.get(p["category"], 4) for p in problems[:1000]]
+    # FIX: auto-detect categories from actual dataset
+    type_map = build_type_map(problems)
+    type_texts  = [p["problem"] for p in problems[:1000]]
+    type_labels = [type_map.get(p.get("category", "unknown"), 4) for p in problems[:1000]]
+
+    # warn if everything is label 4
+    non_unknown = sum(1 for l in type_labels if l != 4)
+    print(f"  Labeled samples (non-Unknown): {non_unknown}/{len(type_labels)}")
+
     trainer.train_type_classifier(type_texts, type_labels, epochs=min(epochs, 3))
 
     for t in [
@@ -1197,7 +1298,7 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
     ]:
         probs = model.type_classifier.get_probs(t)
         best = max(probs, key=probs.get)
-        print(f"  '{t[:50]}...' -> {best} ({probs[best]:.3f})")
+        print(f"  '{t[:50]}' -> {best} ({probs[best]:.3f})")
 
     # ---- Phase 3: Arithmetic Solver ----
     print("\n[3/4] Training Arithmetic Solver...")
@@ -1206,23 +1307,27 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
         a, b = random.randint(1, 100), random.randint(1, 100)
         op = random.choice(["+", "-", "*"])
         if op == "+":
-            arith_exprs.append(f"{a}+{b}");  arith_answers.append(float(a + b))
+            arith_exprs.append(f"{a}+{b}")
+            arith_answers.append(float(a + b))
         elif op == "-":
             lo, hi = min(a, b), max(a, b)
-            arith_exprs.append(f"{hi}-{lo}"); arith_answers.append(float(hi - lo))
+            arith_exprs.append(f"{hi}-{lo}")
+            arith_answers.append(float(hi - lo))
         else:
             a, b = random.randint(1, 20), random.randint(1, 20)
-            arith_exprs.append(f"{a}*{b}");  arith_answers.append(float(a * b))
+            arith_exprs.append(f"{a}*{b}")
+            arith_answers.append(float(a * b))
+
     trainer.train_arith_solver(arith_exprs[:500], arith_answers[:500], epochs=min(epochs, 3))
 
     for expr in ["10+5", "20-3", "6*7"]:
         pred = model.arith_solver.predict(expr)
         if pred is not None:
-            print(f"  {expr} -> {pred:.2f}")
+            print(f"  {expr} -> {pred:.2f} (expected: {eval(expr)})")
 
     # ---- Phase 4: Evaluate ----
     print("\n[4/4] Evaluation on held-out set...")
-    test = problems[7500:7600]
+    test = problems[min(7500, len(problems) - 100): min(7600, len(problems))]
     correct, total = 0, 0
     for p in test:
         result = model.solve(p["problem"])
@@ -1230,7 +1335,7 @@ def train_neural_mv(dataset_path: str = "synthetic_math_dataset.json",
         try:
             pred_str = str(result["result"])
             pred_val = float(pred_str.split("=")[-1].strip() if "=" in pred_str else pred_str)
-            true_val = float(p["answer"])
+            true_val = float(p.get("answer", p.get("solution", "nan")))
             if abs(pred_val - true_val) / (abs(true_val) + 1e-8) < 0.01:
                 correct += 1
         except (ValueError, IndexError, AttributeError):
