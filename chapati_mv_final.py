@@ -335,23 +335,41 @@ class NeuralTypeClassifier:
     TYPE_NAMES = ["Arithmetic", "Algebraic", "Comparison", "Geometric", "Unknown"]
     NUM_TYPES = 5
 
-    def __init__(self, embed_dim: int = 64, hidden_dim: int = 64):
-        self.char_embedding = np.random.randn(CHAR_VOCAB_SIZE, embed_dim).astype(np.float32) * 0.02
-        self.fc1_w = np.random.randn(embed_dim, hidden_dim).astype(np.float32) * 0.1
+    def __init__(self, embed_dim: int = 128, hidden_dim: int = 128):
+        self.embed_dim = embed_dim
+        # 1. HE INITIALIZATION: Essential to prevent the 0.69 loss "guessing" trap
+        self.char_embedding = (np.random.randn(CHAR_VOCAB_SIZE, embed_dim) * np.sqrt(2.0 / embed_dim)).astype(np.float32)
+        
+        # 2. PARAMETER BOOST: Double input size (embed_dim * 2) for Mean-Max concat
+        self.fc1_w = (np.random.randn(embed_dim * 2, hidden_dim) * np.sqrt(2.0 / (embed_dim * 2))).astype(np.float32)
         self.fc1_b = np.zeros(hidden_dim, dtype=np.float32)
-        self.fc2_w = np.random.randn(hidden_dim, self.NUM_TYPES).astype(np.float32) * 0.1
+        
+        self.fc2_w = (np.random.randn(hidden_dim, self.NUM_TYPES) * np.sqrt(2.0 / hidden_dim)).astype(np.float32)
         self.fc2_b = np.zeros(self.NUM_TYPES, dtype=np.float32)
 
     def forward(self, text: str) -> np.ndarray:
         char_ids = text_to_char_ids(text)
-        embeds = char_ids_to_embedding(char_ids, self.char_embedding)
-        pooled = embeds.mean(axis=0)
+        if len(char_ids) == 0:
+            return np.array([0, 0, 0, 0, 1.0]) # Return Unknown for empty strings
+            
+        embeds = self.char_embedding[char_ids]
+        
+        # 3. ARCHITECTURE FIX: MEAN-MAX POOLING
+        # This prevents the "Unknown" ghosting by picking out specific 
+        # math operators from the background text.
+        p_mean = np.mean(embeds, axis=0)
+        p_max = np.max(embeds, axis=0)
+        pooled = np.concatenate([p_mean, p_max]) 
+        
         z1 = cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b
         h1 = gelu(z1)
         logits = cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b
+        
+        # Softmax for multi-class classification
         return softmax(logits)
 
     def classify(self, text: str) -> str:
+        # argmax determines which category name to return
         return self.TYPE_NAMES[int(np.argmax(self.forward(text)))]
 
     def get_probs(self, text: str) -> Dict[str, float]:
@@ -367,8 +385,10 @@ class NeuralTypeClassifier:
 
     def load_weights(self, w: Dict):
         self.char_embedding = w["char_embedding"].copy()
-        self.fc1_w = w["fc1_w"].copy(); self.fc1_b = w["fc1_b"].copy()
-        self.fc2_w = w["fc2_w"].copy(); self.fc2_b = w["fc2_b"].copy()
+        self.fc1_w = w["fc1_w"].copy()
+        self.fc1_b = w["fc1_b"].copy()
+        self.fc2_w = w["fc2_w"].copy()
+        self.fc2_b = w["fc2_b"].copy()
 
 
 # ============================================================
