@@ -390,22 +390,36 @@ class NeuralAimClassifier:
     AIM_NAMES = ["Calculate", "Simplify", "Solve", "Compare", "Evaluate", "Unknown"]
     NUM_AIMS = 6
 
-    def __init__(self, embed_dim: int = 64, hidden_dim: int = 64):
-        self.char_embedding = np.random.randn(CHAR_VOCAB_SIZE, embed_dim).astype(np.float32) * 0.02
-        self.fc1_w = np.random.randn(embed_dim, hidden_dim).astype(np.float32) * 0.1
+    def __init__(self, embed_dim: int = 128, hidden_dim: int = 64):
+        self.embed_dim = embed_dim
+        # Use He Init and expand input for Mean-Max Concat
+        self.char_embedding = (np.random.randn(CHAR_VOCAB_SIZE, embed_dim) * np.sqrt(2.0 / embed_dim)).astype(np.float32)
+        self.fc1_w = (np.random.randn(embed_dim * 2, hidden_dim) * np.sqrt(2.0 / (embed_dim * 2))).astype(np.float32)
         self.fc1_b = np.zeros(hidden_dim, dtype=np.float32)
-        self.fc2_w = np.random.randn(hidden_dim, self.NUM_AIMS).astype(np.float32) * 0.1
+        
+        self.fc2_w = (np.random.randn(hidden_dim, self.NUM_AIMS) * np.sqrt(2.0 / hidden_dim)).astype(np.float32)
         self.fc2_b = np.zeros(self.NUM_AIMS, dtype=np.float32)
 
     def forward(self, text: str) -> np.ndarray:
         char_ids = text_to_char_ids(text)
-        embeds = char_ids_to_embedding(char_ids, self.char_embedding)
-        pooled = embeds.mean(axis=0)
+        if len(char_ids) == 0: return np.array([0,0,0,0,0,1.0])
+        
+        embeds = self.char_embedding[char_ids]
+        
+        # Syncing with the Mean-Max Pooling of the other classes
+        p_mean = np.mean(embeds, axis=0)
+        p_max = np.max(embeds, axis=0)
+        pooled = np.concatenate([p_mean, p_max])
+        
+        # LayerNorm-lite to keep signals consistent across the pipeline
+        pooled = (pooled - np.mean(pooled)) / (np.std(pooled) + 1e-6)
+        
         z1 = cpuwarp_ml.matmul(pooled, self.fc1_w) + self.fc1_b
         h1 = gelu(z1)
         logits = cpuwarp_ml.matmul(h1, self.fc2_w) + self.fc2_b
         return softmax(logits)
 
+    # ... keep identify, get_probs, and weight helpers as they are
     def identify(self, text: str) -> str:
         return self.AIM_NAMES[int(np.argmax(self.forward(text)))]
 
